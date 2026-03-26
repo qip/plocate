@@ -64,6 +64,45 @@ using namespace std::chrono;
 /* Next conf_prunepaths entry */
 static size_t conf_prunepaths_index; /* = 0; */
 
+static bool path_is_excluded(const string &path)
+{
+	for (const string &exc : conf_exclude_paths) {
+		if (path.size() >= exc.size() &&
+		    path.compare(0, exc.size(), exc) == 0 &&
+		    (path.size() == exc.size() || path[exc.size()] == '/')) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool path_is_included(const string &path)
+{
+	if (conf_include_paths.empty()) return true;
+	for (const string &inc : conf_include_paths) {
+		if (path.size() >= inc.size() &&
+		    path.compare(0, inc.size(), inc) == 0 &&
+		    (path.size() == inc.size() || path[inc.size()] == '/')) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// True if an include path is a descendant of path (must traverse to reach it).
+static bool path_leads_to_included(const string &path)
+{
+	if (conf_include_paths.empty()) return true;
+	for (const string &inc : conf_include_paths) {
+		if (inc.size() > path.size() &&
+		    inc.compare(0, path.size(), path) == 0 &&
+		    (path.back() == '/' || inc[path.size()] == '/')) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void usage()
 {
 	printf(
@@ -543,6 +582,20 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 		close(fd);
 		return 0;
 	}
+	if (path_is_excluded(path)) {
+		if (conf_debug_pruning) {
+			fprintf(stderr, "Skipping `%s': in exclude paths\n", path.c_str());
+		}
+		close(fd);
+		return 0;
+	}
+	if (!path_is_included(path) && !path_leads_to_included(path)) {
+		if (conf_debug_pruning) {
+			fprintf(stderr, "Skipping `%s': not in include paths\n", path.c_str());
+		}
+		close(fd);
+		return 0;
+	}
 	if (conf_prune_bind_mounts && is_bind_mount(path.c_str())) {
 		if (conf_debug_pruning) {
 			/* This is debugging output, don't mark anything for translation */
@@ -764,8 +817,11 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 
 	// Actually add all the entries we figured out dates for above.
 	for (const entry &e : entries) {
-		corpus->add_file(path_plus_slash + e.name + "," + std::to_string(e.filesize) + "," + std::to_string(e.allocated), e.dt);
-		dict_builder->add_file(path_plus_slash + e.name + "," + std::to_string(e.filesize) + "," + std::to_string(e.allocated), e.dt);
+		string entry_path = path_plus_slash + e.name;
+		if (path_is_excluded(entry_path) || !path_is_included(entry_path)) continue;
+		string stored = entry_path + "," + std::to_string(e.filesize) + "," + std::to_string(e.allocated);
+		corpus->add_file(stored, e.dt);
+		dict_builder->add_file(stored, e.dt);
 	}
 
 	// Now scan subdirectories.

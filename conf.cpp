@@ -50,6 +50,12 @@ vector<string> conf_prunenames;
 /* Paths to skip, sorted by name using dir_path_cmp () */
 vector<string> conf_prunepaths;
 
+/* Only include paths starting with these prefixes (empty = include all) */
+vector<string> conf_include_paths;
+
+/* Exclude paths starting with these prefixes */
+vector<string> conf_exclude_paths;
+
 /* true if bind mounts should be skipped */
 bool conf_prune_bind_mounts; /* = false; */
 
@@ -326,10 +332,14 @@ help(void)
 	printf(_("Usage: updatedb [OPTION]...\n"
 	         "Update a plocate database.\n"
 	         "\n"
-	         "  -f, --add-prunefs FS           omit also FS (space-separated)\n"
-	         "  -n, --add-prunenames NAMES     omit also NAMES (space-separated)\n"
-	         "  -e, --add-prunepaths PATHS     omit also PATHS (space-separated)\n"
-	         "      --add-single-prunepath PATH  omit also PATH\n"
+	         "  -f, --add-prunefs FS           append to prunefs (space-separated)\n"
+	         "  -n, --add-prunenames NAMES     append to prunenames (space-separated)\n"
+	         "  -e, --add-prunepaths PATHS     append to prunepaths (space-separated)\n"
+	         "      --add-single-prunepath PATH  append one path verbatim to prunepaths\n"
+	         "  -I, --include PATH             only include paths starting with PREFIX\n"
+	         "                                 (prefix match, may be repeated)\n"
+	         "  -X, --exclude PATH             skip all paths starting with PREFIX\n"
+	         "                                 (prefix match, may be repeated)\n"
 	         "  -U, --database-root PATH       the subtree to store in "
 	         "database (default \"/\")\n"
 	         "  -h, --help                     print this help\n"
@@ -339,11 +349,12 @@ help(void)
 	         "                                 in each block (default 32)\n"
 	         "      --prune-bind-mounts FLAG   omit bind mounts (default "
 	         "\"no\")\n"
-	         "      --prunefs FS               filesystems to omit from "
-	         "database\n"
-	         "      --prunenames NAMES         directory names to omit from "
-	         "database\n"
-	         "      --prunepaths PATHS         paths to omit from database\n"
+	         "      --prunefs FS               set filesystem types to omit\n"
+	         "                                 (replaces config, space-separated)\n"
+	         "      --prunenames NAMES         set directory names to omit\n"
+	         "                                 (replaces config, space-separated)\n"
+	         "      --prunepaths PATHS         set exact paths to omit\n"
+	         "                                 (replaces config, space-separated)\n"
 	         "  -l, --require-visibility FLAG  check visibility before "
 	         "reporting files\n"
 	         "                                 (default \"yes\")\n"
@@ -391,6 +402,8 @@ parse_arguments(int argc, char *argv[])
 		{ "add-prunenames", required_argument, NULL, 'n' },
 		{ "add-prunepaths", required_argument, NULL, 'e' },
 		{ "add-single-prunepath", required_argument, NULL, OPT_ADD_SINGLE_PRUNEPATH },
+		{ "include", required_argument, NULL, 'I' },
+		{ "exclude", required_argument, NULL, 'X' },
 		{ "database-root", required_argument, NULL, 'U' },
 		{ "debug-pruning", no_argument, NULL, OPT_DEBUG_PRUNING },
 		{ "help", no_argument, NULL, 'h' },
@@ -418,7 +431,7 @@ parse_arguments(int argc, char *argv[])
 	for (;;) {
 		int opt, idx;
 
-		opt = getopt_long(argc, argv, "U:Ve:f:hl:n:o:vb:D", options, &idx);
+		opt = getopt_long(argc, argv, "U:Ve:f:hl:n:o:vb:DI:X:", options, &idx);
 		switch (opt) {
 		case -1:
 			goto options_done;
@@ -509,6 +522,14 @@ parse_arguments(int argc, char *argv[])
 		case 'f':
 			prunefs_changed = true;
 			var_add_values(&conf_prunefs, optarg);
+			break;
+
+		case 'I':
+			conf_include_paths.push_back(optarg);
+			break;
+
+		case 'X':
+			conf_exclude_paths.push_back(optarg);
 			break;
 
 		case 'h':

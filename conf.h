@@ -40,6 +40,12 @@ extern std::vector<std::string> conf_prunenames;
 /* Paths to skip, sorted by name using dir_path_cmp () */
 extern std::vector<std::string> conf_prunepaths;
 
+/* Only include paths starting with these prefixes (empty = include all) */
+extern std::vector<std::string> conf_include_paths;
+
+/* Exclude paths starting with these prefixes */
+extern std::vector<std::string> conf_exclude_paths;
+
 /* true if bind mounts should be skipped */
 extern bool conf_prune_bind_mounts;
 
