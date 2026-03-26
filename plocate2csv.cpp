@@ -1,6 +1,7 @@
 #include "complete_pread.h"
 #include "db.h"
 
+#include <algorithm>
 #include <fcntl.h>
 #include <getopt.h>
 #include <stdint.h>
@@ -10,6 +11,8 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <zstd.h>
@@ -19,6 +22,20 @@ using namespace std;
 struct PathMapping {
 	string prefix;  // e.g. "/catalyst/"
 	string drive;   // e.g. "Z:"
+};
+
+struct FileEntry {
+	string path;
+	long long size;
+	long long allocated;
+};
+
+struct DirStats {
+	long long total_size = 0;
+	long long total_allocated = 0;
+	long long file_count = 0;
+	long long folder_count = 0;
+	bool in_db = false;
 };
 
 static void usage()
@@ -53,22 +70,14 @@ static void slash_to_backslash(string &s)
 }
 
 // Parse a mapping argument "FROM:TO" where TO is a drive letter like "Z:".
-// The colon inside "Z:" makes this tricky; we split on the last two-char
-// sequence matching X: where X is an ascii letter.
+// Format: /prefix/:Z:  (the middle colon is separator)
 static bool parse_mapping(const char *arg, PathMapping *out)
 {
 	string s(arg);
-	// Find the separator colon: look for ":X:" pattern or just split
-	// at the last colon that is followed by a letter and colon.
-	// Simple approach: the TO part is always the last 2 chars like "Z:"
-	// Format: /prefix/:Z:  (the middle colon is separator)
-	// So we find the second-to-last colon.
 	if (s.size() < 4) return false;
 
-	// Find last ':'
 	size_t last = s.rfind(':');
 	if (last == string::npos || last == 0) return false;
-	// The drive letter is s[last-1], the separator colon is at last-2
 	if (last < 2) return false;
 	size_t sep = last - 2;
 	if (s[sep] != ':') return false;
@@ -76,6 +85,35 @@ static bool parse_mapping(const char *arg, PathMapping *out)
 	out->prefix = s.substr(0, sep);
 	out->drive = s.substr(sep + 1);
 	return true;
+}
+
+// Extract the path, size, and allocated from a null-terminated db string.
+// Format: "path,filesize,allocated". Returns false if parsing fails.
+static bool parse_entry(const char *p, FileEntry *out)
+{
+	const char *last_comma = strrchr(p, ',');
+	if (last_comma == nullptr || last_comma == p) return false;
+
+	const char *second_last_comma = last_comma - 1;
+	while (second_last_comma > p && *second_last_comma != ',') {
+		--second_last_comma;
+	}
+	if (*second_last_comma != ',') return false;
+
+	out->path.assign(p, second_last_comma - p);
+	out->size = atoll(second_last_comma + 1);
+	out->allocated = atoll(last_comma + 1);
+	return true;
+}
+
+// Walk all '/' positions in path and call fn(parent) for each ancestor.
+template <typename Fn>
+static void for_each_ancestor(const string &path, Fn fn)
+{
+	size_t pos = 0;
+	while ((pos = path.find('/', pos + 1)) != string::npos) {
+		fn(path.substr(0, pos));
+	}
 }
 
 int main(int argc, char **argv)
@@ -154,7 +192,9 @@ int main(int argc, char **argv)
 
 	ZSTD_DCtx *ctx = ZSTD_createDCtx();
 
-	printf("File Name,Size,Allocated,Modified,Attributes,Files,Folders\n");
+	// --- Pass 1: read all entries into memory ---
+	vector<FileEntry> entries;
+	entries.reserve(1 << 20);
 
 	for (uint32_t block = 0; block < num_blocks; ++block) {
 		size_t compressed_len = offsets[block + 1] - offsets[block];
@@ -188,44 +228,89 @@ int main(int argc, char **argv)
 
 		for (const char *p = data.data(); p < data.data() + data.size(); p += strlen(p) + 1) {
 			if (*p == '\0') continue;
-
-			// Each entry is "path,filesize,allocated"
-			// Split on the last two commas (same logic as plocate.cpp).
-			const char *last_comma = strrchr(p, ',');
-			if (last_comma == nullptr || last_comma == p) {
-				// No metadata, output path with defaults.
-				string path(p);
-				if (!mappings.empty()) path = apply_mappings(path, mappings);
-				slash_to_backslash(path);
-				printf("\"%s\",0,0,1970/01/01 00:00:00,0,0,0\n", path.c_str());
-				continue;
+			FileEntry e;
+			if (parse_entry(p, &e)) {
+				entries.push_back(move(e));
+			} else {
+				entries.push_back(FileEntry{ string(p), 0, 0 });
 			}
-			const char *second_last_comma = last_comma - 1;
-			while (second_last_comma > p && *second_last_comma != ',') {
-				--second_last_comma;
-			}
-			if (*second_last_comma != ',') {
-				string path(p);
-				if (!mappings.empty()) path = apply_mappings(path, mappings);
-				slash_to_backslash(path);
-				printf("\"%s\",0,0,1970/01/01 00:00:00,0,0,0\n", path.c_str());
-				continue;
-			}
-
-			string path(p, second_last_comma - p);
-			string size_str(second_last_comma + 1, last_comma - second_last_comma - 1);
-			string alloc_str(last_comma + 1);
-
-			if (!mappings.empty()) path = apply_mappings(path, mappings);
-			slash_to_backslash(path);
-
-			printf("\"%s\",%s,%s,1970/01/01 00:00:00,0,0,0\n",
-			       path.c_str(), size_str.c_str(), alloc_str.c_str());
 		}
 	}
 
 	ZSTD_freeDCtx(ctx);
 	if (ddict != nullptr) ZSTD_freeDDict(ddict);
 	close(fd);
+
+	// --- Pass 2: identify directories ---
+	// A path is a directory if it appears as a proper prefix component of another entry.
+	unordered_set<string> dir_set;
+	for (const auto &e : entries) {
+		for_each_ancestor(e.path, [&](const string &parent) {
+			dir_set.insert(parent);
+		});
+	}
+
+	// --- Pass 3: aggregate stats for each directory ---
+	unordered_map<string, DirStats> dir_stats;
+	for (const auto &d : dir_set) {
+		dir_stats[d];
+	}
+
+	for (const auto &e : entries) {
+		if (dir_set.count(e.path)) {
+			dir_stats[e.path].in_db = true;
+		}
+	}
+
+	for (const auto &e : entries) {
+		bool is_dir = dir_set.count(e.path);
+		long long sz = max(e.size, 0LL);
+		long long alloc = max(e.allocated, 0LL);
+
+		for_each_ancestor(e.path, [&](const string &parent) {
+			auto &ds = dir_stats[parent];
+			if (is_dir) {
+				ds.folder_count++;
+			} else {
+				ds.total_size += sz;
+				ds.total_allocated += alloc;
+				ds.file_count++;
+			}
+		});
+	}
+
+	// --- Pass 4: output ---
+	printf("File Name,Size,Allocated,Modified,Attributes,Files,Folders\n");
+
+	for (const auto &e : entries) {
+		bool is_dir = dir_set.count(e.path);
+		string path = e.path;
+		if (!mappings.empty()) path = apply_mappings(path, mappings);
+		slash_to_backslash(path);
+
+		if (is_dir) {
+			const auto &ds = dir_stats[e.path];
+			printf("\"%s\\\",%lld,%lld,1970/01/01 00:00:00,0,%lld,%lld\n",
+			       path.c_str(), ds.total_size, ds.total_allocated,
+			       ds.file_count, ds.folder_count);
+		} else {
+			long long sz = max(e.size, 0LL);
+			long long alloc = max(e.allocated, 0LL);
+			printf("\"%s\",%lld,%lld,1970/01/01 00:00:00,0,0,0\n",
+			       path.c_str(), sz, alloc);
+		}
+	}
+
+	// Output implied parent directories not present as db entries.
+	for (const auto &[dirpath, ds] : dir_stats) {
+		if (ds.in_db) continue;
+		string path = dirpath;
+		if (!mappings.empty()) path = apply_mappings(path, mappings);
+		slash_to_backslash(path);
+		printf("\"%s\\\",%lld,%lld,1970/01/01 00:00:00,0,%lld,%lld\n",
+		       path.c_str(), ds.total_size, ds.total_allocated,
+		       ds.file_count, ds.folder_count);
+	}
+
 	return 0;
 }
