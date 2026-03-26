@@ -24,6 +24,11 @@ struct PathMapping {
 	string drive;   // e.g. "Z:"
 };
 
+struct StringReplace {
+	string from;
+	string to;
+};
+
 struct FileEntry {
 	string path;
 	long long size;
@@ -41,13 +46,17 @@ struct DirStats {
 static void usage()
 {
 	fprintf(stderr,
-	        "Usage: plocate2csv [-d DBPATH] [--map /prefix/:DRIVE:] ...\n"
+	        "Usage: plocate2csv [-d DBPATH] [-f PREFIX] [--map /prefix/:DRIVE:] ...\n"
 	        "\n"
 	        "Read a plocate database and output WizTree-format CSV.\n"
 	        "\n"
 	        "  -d, --database DBPATH   path to plocate.db (default: plocate.db)\n"
+	        "  -f, --filter PREFIX     only include paths starting with PREFIX\n"
+	        "                          e.g. --filter /catalyst\n"
 	        "  -m, --map FROM:TO       replace path prefix FROM with TO\n"
 	        "                          e.g. --map /catalyst/:Z:\n"
+	        "  -s, --replace FROM:TO   replace all occurrences of FROM with TO in paths\n"
+	        "                          e.g. --replace foo:bar\n"
 	        "      --help              print this help\n");
 }
 
@@ -67,6 +76,28 @@ static void slash_to_backslash(string &s)
 	for (char &c : s) {
 		if (c == '/') c = '\\';
 	}
+}
+
+static void apply_replacements(string &s, const vector<StringReplace> &replacements)
+{
+	for (const auto &r : replacements) {
+		size_t pos = 0;
+		while ((pos = s.find(r.from, pos)) != string::npos) {
+			s.replace(pos, r.from.size(), r.to);
+			pos += r.to.size();
+		}
+	}
+}
+
+static string csv_escape(const string &s)
+{
+	string out;
+	out.reserve(s.size());
+	for (char c : s) {
+		if (c == '"') out += '"';
+		out += c;
+	}
+	return out;
 }
 
 // Parse a mapping argument "FROM:TO" where TO is a drive letter like "Z:".
@@ -119,22 +150,29 @@ static void for_each_ancestor(const string &path, Fn fn)
 int main(int argc, char **argv)
 {
 	string dbpath = "plocate.db";
+	string filter_prefix;
 	vector<PathMapping> mappings;
+	vector<StringReplace> replacements;
 
 	static const struct option long_options[] = {
 		{ "database", required_argument, 0, 'd' },
+		{ "filter", required_argument, 0, 'f' },
 		{ "map", required_argument, 0, 'm' },
+		{ "replace", required_argument, 0, 's' },
 		{ "help", no_argument, 0, 'h' },
 		{ 0, 0, 0, 0 }
 	};
 
 	for (;;) {
 		int option_index = 0;
-		int c = getopt_long(argc, argv, "d:m:h", long_options, &option_index);
+		int c = getopt_long(argc, argv, "d:f:m:s:h", long_options, &option_index);
 		if (c == -1) break;
 		switch (c) {
 		case 'd':
 			dbpath = optarg;
+			break;
+		case 'f':
+			filter_prefix = optarg;
 			break;
 		case 'm': {
 			PathMapping m;
@@ -144,6 +182,17 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			mappings.push_back(move(m));
+			break;
+		}
+		case 's': {
+			string arg(optarg);
+			size_t sep = arg.find(':');
+			if (sep == string::npos || sep == 0) {
+				fprintf(stderr, "Invalid replacement: %s\n", optarg);
+				fprintf(stderr, "Expected format: FROM:TO  (e.g. foo:bar)\n");
+				return 1;
+			}
+			replacements.push_back({ arg.substr(0, sep), arg.substr(sep + 1) });
 			break;
 		}
 		case 'h':
@@ -229,11 +278,21 @@ int main(int argc, char **argv)
 		for (const char *p = data.data(); p < data.data() + data.size(); p += strlen(p) + 1) {
 			if (*p == '\0') continue;
 			FileEntry e;
-			if (parse_entry(p, &e)) {
-				entries.push_back(move(e));
-			} else {
-				entries.push_back(FileEntry{ string(p), 0, 0 });
+			if (!parse_entry(p, &e)) {
+				e = FileEntry{ string(p), 0, 0 };
 			}
+			if (!filter_prefix.empty()) {
+				bool path_under_prefix =
+					e.path.size() >= filter_prefix.size() &&
+					e.path.compare(0, filter_prefix.size(), filter_prefix) == 0 &&
+					(e.path.size() == filter_prefix.size() || e.path[filter_prefix.size()] == '/');
+				bool prefix_under_path =
+					filter_prefix.size() > e.path.size() &&
+					filter_prefix.compare(0, e.path.size(), e.path) == 0 &&
+					filter_prefix[e.path.size()] == '/';
+				if (!path_under_prefix && !prefix_under_path) continue;
+			}
+			entries.push_back(move(e));
 		}
 	}
 
@@ -287,17 +346,18 @@ int main(int argc, char **argv)
 		string path = e.path;
 		if (!mappings.empty()) path = apply_mappings(path, mappings);
 		slash_to_backslash(path);
+		if (!replacements.empty()) apply_replacements(path, replacements);
 
 		if (is_dir) {
 			const auto &ds = dir_stats[e.path];
 			printf("\"%s\\\",%lld,%lld,1970/01/01 00:00:00,0,%lld,%lld\n",
-			       path.c_str(), ds.total_size, ds.total_allocated,
+			       csv_escape(path).c_str(), ds.total_size, ds.total_allocated,
 			       ds.file_count, ds.folder_count);
 		} else {
 			long long sz = max(e.size, 0LL);
 			long long alloc = max(e.allocated, 0LL);
 			printf("\"%s\",%lld,%lld,1970/01/01 00:00:00,0,0,0\n",
-			       path.c_str(), sz, alloc);
+			       csv_escape(path).c_str(), sz, alloc);
 		}
 	}
 
@@ -307,8 +367,9 @@ int main(int argc, char **argv)
 		string path = dirpath;
 		if (!mappings.empty()) path = apply_mappings(path, mappings);
 		slash_to_backslash(path);
+		if (!replacements.empty()) apply_replacements(path, replacements);
 		printf("\"%s\\\",%lld,%lld,1970/01/01 00:00:00,0,%lld,%lld\n",
-		       path.c_str(), ds.total_size, ds.total_allocated,
+		       csv_escape(path).c_str(), ds.total_size, ds.total_allocated,
 		       ds.file_count, ds.folder_count);
 	}
 
