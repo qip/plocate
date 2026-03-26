@@ -222,11 +222,20 @@ void scan_file_block(const vector<Needle> &needles, string_view compressed,
 	for (const char *filename = block.data();
 	     filename != block.data() + block.size();
 	     filename += strlen(filename) + 1) {
-		const char *haystack = filename;
+        const char *last_delimiter_position = strrchr(filename, ',');
+        const char *second_to_last_delimiter_position = last_delimiter_position - 1;
+        while(second_to_last_delimiter_position >= filename && *second_to_last_delimiter_position != ',') {
+            second_to_last_delimiter_position--;
+        }
+        size_t new_length = second_to_last_delimiter_position - filename;
+        char * hay = (char *)malloc(new_length + 1);
+        memcpy(hay, filename, new_length);
+        hay[new_length] = '\0';
+		const char *haystack = hay;
 		if (match_basename) {
-			haystack = strrchr(filename, '/');
+			haystack = strrchr(hay, '/');
 			if (haystack == nullptr) {
-				haystack = filename;
+				haystack = hay;
 			} else {
 				++haystack;
 			}

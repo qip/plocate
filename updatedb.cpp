@@ -150,6 +150,8 @@ bool time_is_current(const dir_time &t)
 
 struct entry {
 	string name;
+    off_t filesize = -1;
+    off_t allocated = -1;
 	bool is_directory;
 
 	// For directories only:
@@ -590,6 +592,11 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 
 		entry e;
 		e.name = record.first.substr(path_plus_slash.size());
+        struct stat buf;
+        if (fstatat(fd, e.name.c_str(), &buf, 0) == 0) {
+            e.filesize = buf.st_size;
+            e.allocated = buf.st_blocks * 512;
+        }
 		e.is_directory = (record.second.sec >= 0);
 		e.db_modified = record.second;
 		db_entries.push_back(e);
@@ -646,9 +653,16 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 					e.is_directory = true;
 				} else {
 					e.is_directory = false;
+                    e.filesize = buf.st_size;
+                    e.allocated = buf.st_blocks * 512;
 				}
 			} else {
 				e.is_directory = (de->d_type == DT_DIR);
+				struct stat buf;
+				if (fstatat(fd, de->d_name, &buf, 0) == 0) {
+                    e.filesize = buf.st_size;
+                    e.allocated = buf.st_blocks * 512;
+				}
 			}
 
 			if (conf_verbose) {
@@ -750,8 +764,8 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 
 	// Actually add all the entries we figured out dates for above.
 	for (const entry &e : entries) {
-		corpus->add_file(path_plus_slash + e.name, e.dt);
-		dict_builder->add_file(path_plus_slash + e.name, e.dt);
+		corpus->add_file(path_plus_slash + e.name + "," + std::to_string(e.filesize) + "," + std::to_string(e.allocated), e.dt);
+		dict_builder->add_file(path_plus_slash + e.name + "," + std::to_string(e.filesize) + "," + std::to_string(e.allocated), e.dt);
 	}
 
 	// Now scan subdirectories.
