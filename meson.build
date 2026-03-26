@@ -38,6 +38,9 @@ executable('plocate-build', ['plocate-build.cpp', 'database-builder.cpp'],
 	dependencies: [zstddep],
 	install: true,
 	install_dir: get_option('sbindir'))
+executable('plocate2csv', ['plocate2csv.cpp', 'complete_pread.cpp'],
+	dependencies: [zstddep],
+	install: false)
 updatedb_progname = get_option('updatedb_progname')
 executable(updatedb_progname, ['updatedb.cpp', 'database-builder.cpp', 'conf.cpp', 'lib.cpp', 'bind-mount.cpp', 'complete_pread.cpp'],
 	dependencies: [zstddep, threaddep],
