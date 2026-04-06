@@ -152,6 +152,22 @@ Note that the visibility flag is checked only if the database is owned by
 and it is not readable by "others".
 
 .TP
+\fB\-\-checksum\-command\fR \fICMD\fR
+Compute a checksum for each file by running \fICMD\fR (e.g.\&
+.BR sha256sum ).
+\fICMD\fR is invoked as \fICMD FILE\fR for every eligible file, and
+.B updatedb
+reads the first whitespace\-delimited token of its standard output as the
+hex\-encoded checksum.
+If this option is not set, checksums are not computed, but any existing
+checksums in the database are preserved.
+
+.TP
+\fB\-\-min\-checksum\-size\fR \fIBYTES\fR
+Skip checksum computation for files smaller than \fIBYTES\fR (default 0).
+Files that are skipped will have an empty checksum in the database.
+
+.TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Output path names of files to standard output, as soon as they are found.
 

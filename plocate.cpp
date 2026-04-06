@@ -68,6 +68,9 @@ static int64_t *filesize_array = nullptr;
 static size_t filesize_total_files = 0;
 static uint32_t db_block_size = 0;
 
+static vector<string> checksum_array;
+static bool has_checksum_data = false;
+
 class Corpus {
 public:
 	Corpus(int fd, const char *filename_for_errors, IOUringEngine *engine);
@@ -121,6 +124,10 @@ Corpus::Corpus(int fd, const char *filename_for_errors, IOUringEngine *engine)
 		hdr.filesize_data_length_bytes = 0;
 		hdr.filesize_data_offset_bytes = 0;
 		hdr.block_size = 0;
+	}
+	if (hdr.max_version < 4) {
+		hdr.checksum_data_length_bytes = 0;
+		hdr.checksum_data_offset_bytes = 0;
 	}
 }
 
@@ -212,7 +219,54 @@ static void load_filesize_data(int fd, const Header &hdr)
 	db_block_size = hdr.block_size;
 }
 
-static string format_with_filesize(const char *filename, uint32_t docid, uint32_t local_file_idx)
+static void load_checksum_data(int fd, const Header &hdr)
+{
+	if (hdr.checksum_data_length_bytes == 0 || hdr.block_size == 0)
+		return;
+
+	string compressed(hdr.checksum_data_length_bytes, '\0');
+	complete_pread(fd, &compressed[0], hdr.checksum_data_length_bytes, hdr.checksum_data_offset_bytes);
+
+	ZSTD_DCtx *ctx = ZSTD_createDCtx();
+	string decompressed;
+	ZSTD_inBuffer in = { compressed.data(), compressed.size(), 0 };
+	while (in.pos < in.size) {
+		char outbuf[65536];
+		ZSTD_outBuffer out = { outbuf, sizeof(outbuf), 0 };
+		size_t ret = ZSTD_decompressStream(ctx, &out, &in);
+		if (ZSTD_isError(ret)) {
+			fprintf(stderr, "ZSTD_decompressStream() for checksum data: %s\n", ZSTD_getErrorName(ret));
+			ZSTD_freeDCtx(ctx);
+			return;
+		}
+		decompressed.append(outbuf, out.pos);
+	}
+	ZSTD_freeDCtx(ctx);
+
+	const char *ptr = decompressed.data();
+	const char *end = ptr + decompressed.size();
+	while (ptr < end) {
+		uint8_t len = static_cast<uint8_t>(*ptr++);
+		if (ptr + len > end) break;
+		checksum_array.emplace_back(ptr, len);
+		ptr += len;
+	}
+	has_checksum_data = !checksum_array.empty();
+}
+
+static string bytes_to_hex(const string &bytes)
+{
+	string hex;
+	hex.reserve(bytes.size() * 2);
+	for (unsigned char c : bytes) {
+		char buf[3];
+		snprintf(buf, sizeof(buf), "%02x", c);
+		hex.append(buf, 2);
+	}
+	return hex;
+}
+
+static string format_with_metadata(const char *filename, uint32_t docid, uint32_t local_file_idx)
 {
 	if (filesize_array == nullptr || db_block_size == 0)
 		return filename;
@@ -221,9 +275,15 @@ static string format_with_filesize(const char *filename, uint32_t docid, uint32_
 	if (global_idx >= filesize_total_files)
 		return filename;
 
-	return string(filename) + "," +
-	       to_string(filesize_array[global_idx * 2]) + "," +
-	       to_string(filesize_array[global_idx * 2 + 1]);
+	string result = string(filename) + "," +
+	                to_string(filesize_array[global_idx * 2]) + "," +
+	                to_string(filesize_array[global_idx * 2 + 1]);
+
+	if (has_checksum_data && global_idx < checksum_array.size() && !checksum_array[global_idx].empty()) {
+		result += "," + bytes_to_hex(checksum_array[global_idx]);
+	}
+
+	return result;
 }
 
 void scan_file_block(const vector<Needle> &needles, string_view compressed,
@@ -300,7 +360,7 @@ void scan_file_block(const vector<Needle> &needles, string_view compressed,
 				++local_seq;
 			}
 			pending_candidate = filename;
-			pending_display = format_with_filesize(filename, docid, local_file_idx);
+			pending_display = format_with_metadata(filename, docid, local_file_idx);
 		}
 	}
 	if (pending_candidate == nullptr) {
@@ -547,6 +607,7 @@ uint64_t do_search_file(const vector<Needle> &needles, const std::string &filena
 	IOUringEngine engine(/*slop_bytes=*/16);  // 16 slop bytes as described in turbopfor.h.
 	Corpus corpus(fd, filename.c_str(), &engine);
 	load_filesize_data(fd, corpus.get_hdr());
+	load_checksum_data(fd, corpus.get_hdr());
 	dprintf("Corpus init done after %.1f ms.\n", 1e3 * duration<float>(steady_clock::now() - start).count());
 
 	vector<TrigramDisjunction> trigram_groups;

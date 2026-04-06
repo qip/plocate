@@ -54,6 +54,7 @@ any later version.
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -189,9 +190,11 @@ bool time_is_current(const dir_time &t)
 
 struct entry {
 	string name;
-    off_t filesize = -1;
-    off_t allocated = -1;
+	off_t filesize = -1;
+	off_t allocated = -1;
 	bool is_directory;
+	string checksum;
+	struct timespec file_mtime = { 0, 0 };
 
 	// For directories only:
 	int fd = -1;
@@ -270,6 +273,7 @@ struct db_record {
 	dir_time dt;
 	int64_t filesize = -1;
 	int64_t allocated = -1;
+	string checksum;
 };
 
 class ExistingDB {
@@ -305,6 +309,12 @@ private:
 	string current_filesize_block;
 	const char *current_filesize_ptr = nullptr, *current_filesize_end = nullptr;
 
+	bool has_checksum_data = false;
+	off_t compressed_checksum_pos;
+	string compressed_checksum;
+	string current_checksum_block;
+	const char *current_checksum_ptr = nullptr, *current_checksum_end = nullptr;
+
 	db_record unread_record;
 
 	// Used in one-shot mode, repeatedly.
@@ -313,6 +323,7 @@ private:
 	// Used in streaming mode.
 	ZSTD_DCtx *dir_time_ctx;
 	ZSTD_DCtx *filesize_ctx = nullptr;
+	ZSTD_DCtx *checksum_dctx = nullptr;
 
 	ZSTD_DDict *ddict = nullptr;
 
@@ -399,6 +410,15 @@ ExistingDB::ExistingDB(int fd)
 		hdr.filesize_data_length_bytes = 0;
 		hdr.filesize_data_offset_bytes = 0;
 		hdr.block_size = 0;
+	}
+
+	if (hdr.max_version >= 4 && hdr.checksum_data_length_bytes > 0) {
+		has_checksum_data = true;
+		compressed_checksum_pos = hdr.checksum_data_offset_bytes;
+		checksum_dctx = ZSTD_createDCtx();
+	} else {
+		hdr.checksum_data_length_bytes = 0;
+		hdr.checksum_data_offset_bytes = 0;
 	}
 
 	ctx = ZSTD_createDCtx();
@@ -612,6 +632,77 @@ db_record ExistingDB::read_next()
 		}
 	}
 
+	// Read checksum data if available (variable-length: uint8 len + len bytes).
+	string checksum;
+	if (has_checksum_data) {
+		auto ensure_checksum_bytes = [&](size_t needed) -> bool {
+			while (current_checksum_ptr == current_checksum_end ||
+			       size_t(current_checksum_end - current_checksum_ptr) < needed) {
+				if (current_checksum_ptr != nullptr) {
+					const size_t bytes_consumed = current_checksum_ptr - current_checksum_block.data();
+					current_checksum_block.erase(current_checksum_block.begin(), current_checksum_block.begin() + bytes_consumed);
+				}
+
+				const size_t existing_data = current_checksum_block.size();
+				current_checksum_block.resize(existing_data + 4096);
+
+				ZSTD_outBuffer outbuf;
+				outbuf.dst = current_checksum_block.data() + existing_data;
+				outbuf.size = 4096;
+				outbuf.pos = 0;
+
+				ZSTD_inBuffer inbuf;
+				inbuf.src = compressed_checksum.data();
+				inbuf.size = compressed_checksum.size();
+				inbuf.pos = 0;
+
+				int err = ZSTD_decompressStream(checksum_dctx, &outbuf, &inbuf);
+				if (err < 0) {
+					if (conf_verbose) {
+						fprintf(stderr, "ZSTD_decompress(checksum): %s\n", ZSTD_getErrorName(err));
+					}
+					has_checksum_data = false;
+					return false;
+				}
+				compressed_checksum.erase(compressed_checksum.begin(), compressed_checksum.begin() + inbuf.pos);
+				current_checksum_block.resize(existing_data + outbuf.pos);
+
+				if (inbuf.pos == 0 && outbuf.pos == 0) {
+					char buf[4096];
+					size_t bytes_to_read = min<size_t>(
+						hdr.checksum_data_offset_bytes + hdr.checksum_data_length_bytes - compressed_checksum_pos,
+						sizeof(buf));
+					if (bytes_to_read == 0) {
+						has_checksum_data = false;
+						return false;
+					}
+					if (!try_complete_pread(fd, buf, bytes_to_read, compressed_checksum_pos)) {
+						if (conf_verbose) {
+							perror("pread(checksum)");
+						}
+						has_checksum_data = false;
+						return false;
+					}
+					compressed_checksum_pos += bytes_to_read;
+					compressed_checksum.insert(compressed_checksum.end(), buf, buf + bytes_to_read);
+				}
+
+				current_checksum_ptr = current_checksum_block.data();
+				current_checksum_end = current_checksum_block.data() + current_checksum_block.size();
+			}
+			return true;
+		};
+
+		if (ensure_checksum_bytes(1)) {
+			uint8_t len = static_cast<uint8_t>(*current_checksum_ptr);
+			current_checksum_ptr++;
+			if (len > 0 && ensure_checksum_bytes(len)) {
+				checksum.assign(current_checksum_ptr, len);
+				current_checksum_ptr += len;
+			}
+		}
+	}
+
 	string filename = current_filename_ptr;
 	current_filename_ptr += filename.size() + 1;
 	if (current_filename_ptr == current_filename_end) {
@@ -630,7 +721,7 @@ db_record ExistingDB::read_next()
 		current_dir_time_ptr += sizeof(dt.nsec);
 	}
 
-	return { move(filename), dt, filesize, allocated };
+	return { move(filename), dt, filesize, allocated, move(checksum) };
 }
 
 string ExistingDB::read_next_dictionary() const
@@ -656,6 +747,72 @@ string ExistingDB::read_next_dictionary() const
 // directory, probably in the interest of portability to old platforms.)
 // “parent_dev” must be the device of the parent directory of “path”.
 //
+static string hex_to_bytes(const string &hex)
+{
+	string bytes;
+	bytes.reserve(hex.size() / 2);
+	for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+		unsigned int byte;
+		if (sscanf(hex.c_str() + i, "%2x", &byte) != 1)
+			return "";
+		bytes.push_back(static_cast<char>(byte));
+	}
+	return bytes;
+}
+
+static struct timespec db_file_mtime = { 0, 0 };
+
+static string compute_checksum(const string &command, const string &filepath)
+{
+	int pipefd[2];
+	if (pipe(pipefd) == -1)
+		return "";
+
+	pid_t pid = fork();
+	if (pid == -1) {
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return "";
+	}
+	if (pid == 0) {
+		close(pipefd[0]);
+		dup2(pipefd[1], STDOUT_FILENO);
+		close(pipefd[1]);
+		int devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0) {
+			dup2(devnull, STDERR_FILENO);
+			close(devnull);
+		}
+		execlp(command.c_str(), command.c_str(), filepath.c_str(), nullptr);
+		_exit(127);
+	}
+
+	close(pipefd[1]);
+	string output;
+	char buf[1024];
+	for (;;) {
+		ssize_t n = read(pipefd[0], buf, sizeof(buf));
+		if (n <= 0) break;
+		output.append(buf, n);
+	}
+	close(pipefd[0]);
+
+	int status;
+	waitpid(pid, &status, 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return "";
+
+	while (!output.empty() && (output.back() == '\n' || output.back() == '\r' || output.back() == ' '))
+		output.pop_back();
+	if (output.empty())
+		return "";
+
+	size_t pos = output.find_first_of(" \t");
+	string hex_str = (pos != string::npos) ? output.substr(0, pos) : output;
+
+	return hex_to_bytes(hex_str);
+}
+
 // Takes ownership of fd.
 int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_time db_modified, ExistingDB *existing_db, DatabaseReceiver *corpus, DictionaryBuilder *dict_builder)
 {
@@ -731,10 +888,12 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 		if (fstatat(fd, e.name.c_str(), &buf, 0) == 0) {
 			e.filesize = buf.st_size;
 			e.allocated = buf.st_blocks * 512;
+			e.file_mtime = buf.st_mtim;
 		} else if (record.filesize >= 0) {
 			e.filesize = record.filesize;
 			e.allocated = record.allocated;
 		}
+		e.checksum = move(record.checksum);
 		e.is_directory = (record.dt.sec >= 0);
 		e.db_modified = record.dt;
 		db_entries.push_back(e);
@@ -779,27 +938,23 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 			entry e;
 			e.name = de->d_name;
 			if (de->d_type == DT_UNKNOWN) {
-				// Evidently some file systems, like older versions of XFS
-				// (mkfs.xfs -m crc=0 -n ftype=0), can return this,
-				// and we need a stat(). If we wanted to optimize for this,
-				// we could probably defer it to later (we're stat-ing directories
-				// when recursing), but this is rare, and not really worth it --
-				// the second stat() will be cached anyway.
 				struct stat buf;
 				if (fstatat(fd, de->d_name, &buf, AT_SYMLINK_NOFOLLOW) == 0 &&
 				    S_ISDIR(buf.st_mode)) {
 					e.is_directory = true;
 				} else {
 					e.is_directory = false;
-                    e.filesize = buf.st_size;
-                    e.allocated = buf.st_blocks * 512;
+					e.filesize = buf.st_size;
+					e.allocated = buf.st_blocks * 512;
+					e.file_mtime = buf.st_mtim;
 				}
 			} else {
 				e.is_directory = (de->d_type == DT_DIR);
 				struct stat buf;
 				if (fstatat(fd, de->d_name, &buf, 0) == 0) {
-                    e.filesize = buf.st_size;
-                    e.allocated = buf.st_blocks * 512;
+					e.filesize = buf.st_size;
+					e.allocated = buf.st_blocks * 512;
+					e.file_mtime = buf.st_mtim;
 				}
 			}
 
@@ -820,10 +975,11 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 				if (e.name < db_it->name) {
 					break;
 				}
-				if (e.name == db_it->name) {
-					e.db_modified = db_it->db_modified;
-					break;
-				}
+			if (e.name == db_it->name) {
+				e.db_modified = db_it->db_modified;
+				e.checksum = db_it->checksum;
+				break;
+			}
 			}
 		}
 	}
@@ -900,11 +1056,30 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 		e.dt = get_dirtime_from_stat(buf);
 	}
 
+	// Compute checksums where needed.
+	if (!conf_checksum_command.empty()) {
+		for (entry &e : entries) {
+			if (e.is_directory) continue;
+			if (e.filesize >= 0 && e.filesize < conf_min_checksum_size) {
+				e.checksum.clear();
+				continue;
+			}
+			bool needs_recompute = e.checksum.empty() ||
+				(e.file_mtime.tv_sec > db_file_mtime.tv_sec ||
+				 (e.file_mtime.tv_sec == db_file_mtime.tv_sec &&
+				  e.file_mtime.tv_nsec > db_file_mtime.tv_nsec));
+			if (needs_recompute) {
+				string filepath = path_plus_slash + e.name;
+				e.checksum = compute_checksum(conf_checksum_command, filepath);
+			}
+		}
+	}
+
 	// Actually add all the entries we figured out dates for above.
 	for (const entry &e : entries) {
 		string entry_path = path_plus_slash + e.name;
 		if (path_is_excluded(entry_path) || !path_is_included(entry_path)) continue;
-		corpus->add_file(entry_path, e.dt, e.filesize, e.allocated);
+		corpus->add_file(entry_path, e.dt, e.filesize, e.allocated, e.checksum);
 		dict_builder->add_file(entry_path, e.dt);
 	}
 
@@ -955,6 +1130,12 @@ int main(int argc, char **argv)
 	}
 
 	int fd = open(conf_output.c_str(), O_RDONLY);
+	if (fd != -1) {
+		struct stat db_stat;
+		if (fstat(fd, &db_stat) == 0) {
+			db_file_mtime = db_stat.st_mtim;
+		}
+	}
 	ExistingDB existing_db(fd);
 
 	DictionaryBuilder dict_builder(/*blocks_to_keep=*/1000, conf_block_size);
@@ -971,7 +1152,7 @@ int main(int argc, char **argv)
 
 	DatabaseBuilder db(conf_output.c_str(), owner, conf_block_size, existing_db.read_next_dictionary(), conf_check_visibility);
 	db.set_conf_block(conf_block);
-	DatabaseReceiver *corpus = db.start_corpus(/*store_dir_times=*/true, /*store_filesizes=*/true);
+	DatabaseReceiver *corpus = db.start_corpus(/*store_dir_times=*/true, /*store_filesizes=*/true, /*store_checksums=*/true);
 
 	int root_fd = opendir_noatime(AT_FDCWD, conf_scan_root);
 	if (root_fd == -1) {

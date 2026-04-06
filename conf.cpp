@@ -77,6 +77,9 @@ string conf_block;
 int conf_block_size = 32;
 bool use_debug = false;
 
+string conf_checksum_command;
+int64_t conf_min_checksum_size = 0;
+
 /* Parse a STR, store the parsed boolean value to DEST;
    return 0 if OK, -1 on error. */
 static int
@@ -361,6 +364,11 @@ help(void)
 	         "  -v, --verbose                  print paths of files as they "
 	         "are found\n"
 	         "  -V, --version                  print version information\n"
+	         "      --checksum-command CMD     compute file checksums using CMD\n"
+	         "                                 (e.g. sha256sum); if not set,\n"
+	         "                                 checksums are not computed\n"
+	         "      --min-checksum-size BYTES  skip checksum for files smaller\n"
+	         "                                 than BYTES (default 0)\n"
 	         "\n"
 	         "The configuration defaults to values read from\n"
 	         "`%s'.\n"),
@@ -395,7 +403,9 @@ static void
 parse_arguments(int argc, char *argv[])
 {
 	enum { OPT_DEBUG_PRUNING = CHAR_MAX + 1,
-	       OPT_ADD_SINGLE_PRUNEPATH = CHAR_MAX + 2 };
+	       OPT_ADD_SINGLE_PRUNEPATH = CHAR_MAX + 2,
+	       OPT_CHECKSUM_COMMAND = CHAR_MAX + 3,
+	       OPT_MIN_CHECKSUM_SIZE = CHAR_MAX + 4 };
 
 	static const struct option options[] = {
 		{ "add-prunefs", required_argument, NULL, 'f' },
@@ -417,6 +427,8 @@ parse_arguments(int argc, char *argv[])
 		{ "version", no_argument, NULL, 'V' },
 		{ "block-size", required_argument, 0, 'b' },
 		{ "debug", no_argument, 0, 'D' },  // Not documented.
+		{ "checksum-command", required_argument, NULL, OPT_CHECKSUM_COMMAND },
+		{ "min-checksum-size", required_argument, NULL, OPT_MIN_CHECKSUM_SIZE },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -579,6 +591,14 @@ parse_arguments(int argc, char *argv[])
 
 		case OPT_DEBUG_PRUNING:
 			conf_debug_pruning = true;
+			break;
+
+		case OPT_CHECKSUM_COMMAND:
+			conf_checksum_command = optarg;
+			break;
+
+		case OPT_MIN_CHECKSUM_SIZE:
+			conf_min_checksum_size = atoll(optarg);
 			break;
 
 		default:

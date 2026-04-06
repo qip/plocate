@@ -71,4 +71,7 @@ extern void conf_prepare(int argc, char *argv[]);
 extern int conf_block_size;
 extern bool use_debug;
 
+extern std::string conf_checksum_command;
+extern int64_t conf_min_checksum_size;
+
 #endif

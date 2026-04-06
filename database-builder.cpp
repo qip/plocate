@@ -108,7 +108,7 @@ void PostingListBuilder::write_header(uint32_t docid)
 	encoded.insert(encoded.end(), buf, end);
 }
 
-void DictionaryBuilder::add_file(string filename, dir_time, int64_t, int64_t)
+void DictionaryBuilder::add_file(string filename, dir_time, int64_t, int64_t, const string &)
 {
 	if (keep_current_block) {  // Only bother saving the filenames if we're actually keeping the block.
 		if (!current_block.empty()) {
@@ -172,10 +172,10 @@ string DictionaryBuilder::train(size_t buf_size)
 
 class EncodingCorpus : public DatabaseReceiver {
 public:
-	EncodingCorpus(FILE *outfp, size_t block_size, ZSTD_CDict *cdict, bool store_dir_times, bool store_filesizes);
+	EncodingCorpus(FILE *outfp, size_t block_size, ZSTD_CDict *cdict, bool store_dir_times, bool store_filesizes, bool store_checksums);
 	~EncodingCorpus();
 
-	void add_file(std::string filename, dir_time dt, int64_t filesize = -1, int64_t allocated = -1) override;
+	void add_file(std::string filename, dir_time dt, int64_t filesize = -1, int64_t allocated = -1, const std::string &checksum = "") override;
 	void flush_block() override;
 	void finish() override;
 
@@ -204,10 +204,12 @@ public:
 	size_t num_trigrams() const;
 	std::string get_compressed_dir_times();
 	std::string get_compressed_filesizes();
+	std::string get_compressed_checksums();
 
 private:
 	void compress_dir_times(size_t allowed_slop);
 	void compress_filesizes(size_t allowed_slop);
+	void compress_checksums(size_t allowed_slop);
 
 	std::unique_ptr<PostingListBuilder *[]> invindex;
 	FILE *outfp;
@@ -217,6 +219,7 @@ private:
 	const size_t block_size;
 	const bool store_dir_times;
 	const bool store_filesizes;
+	const bool store_checksums;
 	ZSTD_CDict *cdict;
 
 	ZSTD_CStream *dir_time_ctx = nullptr;
@@ -226,10 +229,14 @@ private:
 	ZSTD_CStream *filesize_ctx = nullptr;
 	std::string filesizes;
 	std::string filesizes_compressed;
+
+	ZSTD_CStream *checksum_ctx = nullptr;
+	std::string checksums;
+	std::string checksums_compressed;
 };
 
-EncodingCorpus::EncodingCorpus(FILE *outfp, size_t block_size, ZSTD_CDict *cdict, bool store_dir_times, bool store_filesizes)
-	: invindex(new PostingListBuilder *[NUM_TRIGRAMS]), outfp(outfp), outfp_pos(ftell(outfp)), block_size(block_size), store_dir_times(store_dir_times), store_filesizes(store_filesizes), cdict(cdict)
+EncodingCorpus::EncodingCorpus(FILE *outfp, size_t block_size, ZSTD_CDict *cdict, bool store_dir_times, bool store_filesizes, bool store_checksums)
+	: invindex(new PostingListBuilder *[NUM_TRIGRAMS]), outfp(outfp), outfp_pos(ftell(outfp)), block_size(block_size), store_dir_times(store_dir_times), store_filesizes(store_filesizes), store_checksums(store_checksums), cdict(cdict)
 {
 	fill(invindex.get(), invindex.get() + NUM_TRIGRAMS, nullptr);
 	if (store_dir_times) {
@@ -240,6 +247,10 @@ EncodingCorpus::EncodingCorpus(FILE *outfp, size_t block_size, ZSTD_CDict *cdict
 		filesize_ctx = ZSTD_createCStream();
 		ZSTD_initCStream(filesize_ctx, /*level=*/6);
 	}
+	if (store_checksums) {
+		checksum_ctx = ZSTD_createCStream();
+		ZSTD_initCStream(checksum_ctx, /*level=*/6);
+	}
 }
 
 EncodingCorpus::~EncodingCorpus()
@@ -249,7 +260,7 @@ EncodingCorpus::~EncodingCorpus()
 	}
 }
 
-void EncodingCorpus::add_file(string filename, dir_time dt, int64_t filesize, int64_t allocated)
+void EncodingCorpus::add_file(string filename, dir_time dt, int64_t filesize, int64_t allocated, const string &checksum)
 {
 	++num_files;
 	if (!current_block.empty()) {
@@ -275,6 +286,15 @@ void EncodingCorpus::add_file(string filename, dir_time dt, int64_t filesize, in
 		filesizes.append(reinterpret_cast<const char *>(&filesize), sizeof(filesize));
 		filesizes.append(reinterpret_cast<const char *>(&allocated), sizeof(allocated));
 		compress_filesizes(/*allowed_slop=*/4096);
+	}
+
+	if (store_checksums) {
+		uint8_t len = static_cast<uint8_t>(min<size_t>(checksum.size(), 255));
+		checksums.push_back(static_cast<char>(len));
+		if (len > 0) {
+			checksums.append(checksum.data(), len);
+		}
+		compress_checksums(/*allowed_slop=*/4096);
 	}
 }
 
@@ -334,6 +354,37 @@ void EncodingCorpus::compress_filesizes(size_t allowed_slop)
 
 		filesizes_compressed.resize(old_size + outbuf.pos);
 		filesizes.erase(filesizes.begin(), filesizes.begin() + inbuf.pos);
+
+		if (outbuf.pos == 0 && inbuf.pos == 0) {
+			return;
+		}
+	}
+}
+
+void EncodingCorpus::compress_checksums(size_t allowed_slop)
+{
+	while (checksums.size() >= allowed_slop) {
+		size_t old_size = checksums_compressed.size();
+		checksums_compressed.resize(old_size + 4096);
+
+		ZSTD_outBuffer outbuf;
+		outbuf.dst = checksums_compressed.data() + old_size;
+		outbuf.size = 4096;
+		outbuf.pos = 0;
+
+		ZSTD_inBuffer inbuf;
+		inbuf.src = checksums.data();
+		inbuf.size = checksums.size();
+		inbuf.pos = 0;
+
+		int ret = ZSTD_compressStream(checksum_ctx, &outbuf, &inbuf);
+		if (ret < 0) {
+			fprintf(stderr, "ZSTD_compressStream() failed\n");
+			exit(1);
+		}
+
+		checksums_compressed.resize(old_size + outbuf.pos);
+		checksums.erase(checksums.begin(), checksums.begin() + inbuf.pos);
 
 		if (outbuf.pos == 0 && inbuf.pos == 0) {
 			return;
@@ -480,6 +531,39 @@ string EncodingCorpus::get_compressed_filesizes()
 	return filesizes_compressed;
 }
 
+string EncodingCorpus::get_compressed_checksums()
+{
+	if (!store_checksums) {
+		return "";
+	}
+	compress_checksums(/*allowed_slop=*/0);
+	assert(checksums.empty());
+
+	for (;;) {
+		size_t old_size = checksums_compressed.size();
+		checksums_compressed.resize(old_size + 4096);
+
+		ZSTD_outBuffer outbuf;
+		outbuf.dst = checksums_compressed.data() + old_size;
+		outbuf.size = 4096;
+		outbuf.pos = 0;
+
+		int ret = ZSTD_endStream(checksum_ctx, &outbuf);
+		if (ret < 0) {
+			fprintf(stderr, "ZSTD_endStream() failed\n");
+			exit(1);
+		}
+
+		checksums_compressed.resize(old_size + outbuf.pos);
+
+		if (ret == 0) {
+			break;
+		}
+	}
+
+	return checksums_compressed;
+}
+
 string zstd_compress(const string &src, ZSTD_CDict *cdict, string *tempbuf)
 {
 	static ZSTD_CCtx *ctx = nullptr;
@@ -608,7 +692,7 @@ DatabaseBuilder::DatabaseBuilder(const char *outfile, gid_t owner, int block_siz
 	hdr.extra_ht_slots = num_overflow_slots;
 	hdr.num_docids = 0;
 	hdr.hash_table_offset_bytes = -1;  // We don't know these offsets yet.
-	hdr.max_version = 3;
+	hdr.max_version = 4;
 	hdr.filename_index_offset_bytes = -1;
 	hdr.zstd_dictionary_length_bytes = -1;
 	hdr.check_visibility = check_visibility;
@@ -633,12 +717,14 @@ DatabaseBuilder::DatabaseBuilder(const char *outfile, gid_t owner, int block_siz
 	hdr.filesize_data_length_bytes = 0;
 	hdr.filesize_data_offset_bytes = 0;
 	hdr.block_size = block_size;
+	hdr.checksum_data_length_bytes = 0;
+	hdr.checksum_data_offset_bytes = 0;
 }
 
-DatabaseReceiver *DatabaseBuilder::start_corpus(bool store_dir_times, bool store_filesizes)
+DatabaseReceiver *DatabaseBuilder::start_corpus(bool store_dir_times, bool store_filesizes, bool store_checksums)
 {
 	corpus_start = steady_clock::now();
-	corpus = new EncodingCorpus(outfp, block_size, cdict, store_dir_times, store_filesizes);
+	corpus = new EncodingCorpus(outfp, block_size, cdict, store_dir_times, store_filesizes, store_checksums);
 	return corpus;
 }
 
@@ -758,6 +844,17 @@ void DatabaseBuilder::finish_corpus()
 		compressed_filesizes.clear();
 	}
 
+	// Write the checksum data.
+	string compressed_checksums = corpus->get_compressed_checksums();
+	size_t bytes_for_compressed_checksums = 0;
+	if (!compressed_checksums.empty()) {
+		hdr.checksum_data_offset_bytes = ftell(outfp);
+		hdr.checksum_data_length_bytes = compressed_checksums.size();
+		fwrite(compressed_checksums.data(), compressed_checksums.size(), 1, outfp);
+		bytes_for_compressed_checksums = compressed_checksums.size();
+		compressed_checksums.clear();
+	}
+
 	// Write the recommended dictionary for next update.
 	if (!next_dictionary.empty()) {
 		hdr.next_zstd_dictionary_offset_bytes = ftell(outfp);
@@ -798,7 +895,7 @@ void DatabaseBuilder::finish_corpus()
 
 	fclose(outfp);
 
-	size_t total_bytes = (bytes_for_hashtable + bytes_for_posting_lists + bytes_for_filename_index + bytes_for_filenames + bytes_for_compressed_dir_times + bytes_for_compressed_filesizes);
+	size_t total_bytes = (bytes_for_hashtable + bytes_for_posting_lists + bytes_for_filename_index + bytes_for_filenames + bytes_for_compressed_dir_times + bytes_for_compressed_filesizes + bytes_for_compressed_checksums);
 
 	dprintf("Block size:     %7d files\n", block_size);
 	dprintf("Dictionary:     %'7.1f MB\n", hdr.zstd_dictionary_length_bytes / 1048576.0);
@@ -811,6 +908,9 @@ void DatabaseBuilder::finish_corpus()
 	}
 	if (bytes_for_compressed_filesizes != 0) {
 		dprintf("File sizes:     %'7.1f MB\n", bytes_for_compressed_filesizes / 1048576.0);
+	}
+	if (bytes_for_compressed_checksums != 0) {
+		dprintf("Checksums:      %'7.1f MB\n", bytes_for_compressed_checksums / 1048576.0);
 	}
 	dprintf("Total:          %'7.1f MB\n", total_bytes / 1048576.0);
 	dprintf("\n");

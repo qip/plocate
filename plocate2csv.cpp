@@ -33,7 +33,20 @@ struct FileEntry {
 	string path;
 	long long size;
 	long long allocated;
+	string checksum;
 };
+
+static string bytes_to_hex(const string &bytes)
+{
+	string hex;
+	hex.reserve(bytes.size() * 2);
+	for (unsigned char c : bytes) {
+		char buf[3];
+		snprintf(buf, sizeof(buf), "%02x", c);
+		hex.append(buf, 2);
+	}
+	return hex;
+}
 
 struct DirStats {
 	long long total_size = 0;
@@ -210,6 +223,10 @@ int main(int argc, char **argv)
 		hdr.filesize_data_offset_bytes = 0;
 		hdr.block_size = 0;
 	}
+	if (hdr.max_version < 4) {
+		hdr.checksum_data_length_bytes = 0;
+		hdr.checksum_data_offset_bytes = 0;
+	}
 
 	ZSTD_DDict *ddict = nullptr;
 	if (hdr.zstd_dictionary_length_bytes > 0) {
@@ -249,6 +266,31 @@ int main(int argc, char **argv)
 	}
 	const int64_t *filesize_ptr = reinterpret_cast<const int64_t *>(filesize_data.data());
 	const int64_t *filesize_end = reinterpret_cast<const int64_t *>(filesize_data.data() + filesize_data.size());
+
+	// Decompress the checksum stream if present.
+	string checksum_data;
+	if (hdr.checksum_data_length_bytes > 0) {
+		string compressed_cs(hdr.checksum_data_length_bytes, '\0');
+		complete_pread(fd, &compressed_cs[0], hdr.checksum_data_length_bytes,
+		               hdr.checksum_data_offset_bytes);
+
+		ZSTD_DCtx *cs_ctx = ZSTD_createDCtx();
+		ZSTD_inBuffer cs_in = { compressed_cs.data(), compressed_cs.size(), 0 };
+		while (cs_in.pos < cs_in.size) {
+			char outbuf[65536];
+			ZSTD_outBuffer cs_out = { outbuf, sizeof(outbuf), 0 };
+			size_t ret = ZSTD_decompressStream(cs_ctx, &cs_out, &cs_in);
+			if (ZSTD_isError(ret)) {
+				fprintf(stderr, "checksum stream: ZSTD_decompress: %s\n", ZSTD_getErrorName(ret));
+				checksum_data.clear();
+				break;
+			}
+			checksum_data.append(outbuf, cs_out.pos);
+		}
+		ZSTD_freeDCtx(cs_ctx);
+	}
+	const char *checksum_ptr = checksum_data.data();
+	const char *checksum_end = checksum_data.data() + checksum_data.size();
 
 	ZSTD_DCtx *ctx = ZSTD_createDCtx();
 
@@ -297,6 +339,13 @@ int main(int argc, char **argv)
 			} else {
 				e.size = 0;
 				e.allocated = 0;
+			}
+			if (checksum_ptr < checksum_end) {
+				uint8_t clen = static_cast<uint8_t>(*checksum_ptr++);
+				if (checksum_ptr + clen <= checksum_end) {
+					e.checksum.assign(checksum_ptr, clen);
+					checksum_ptr += clen;
+				}
 			}
 			if (!filter_prefix.empty()) {
 				bool path_under_prefix =
@@ -356,7 +405,7 @@ int main(int argc, char **argv)
 	}
 
 	// --- Pass 4: output ---
-	printf("File Name,Size,Allocated,Modified,Attributes,Files,Folders\n");
+	printf("File Name,Size,Allocated,Modified,Attributes,Files,Folders,Checksum\n");
 
 	for (const auto &e : entries) {
 		bool is_dir = dir_set.count(e.path);
@@ -367,14 +416,15 @@ int main(int argc, char **argv)
 
 		if (is_dir) {
 			const auto &ds = dir_stats[e.path];
-			printf("\"%s\\\",%lld,%lld,1970/01/01 00:00:00,0,%lld,%lld\n",
+			printf("\"%s\\\",%lld,%lld,1970/01/01 00:00:00,0,%lld,%lld,\n",
 			       csv_escape(path).c_str(), ds.total_size, ds.total_allocated,
 			       ds.file_count, ds.folder_count);
 		} else {
 			long long sz = max(e.size, 0LL);
 			long long alloc = max(e.allocated, 0LL);
-			printf("\"%s\",%lld,%lld,1970/01/01 00:00:00,0,0,0\n",
-			       csv_escape(path).c_str(), sz, alloc);
+			string hex = e.checksum.empty() ? "" : bytes_to_hex(e.checksum);
+			printf("\"%s\",%lld,%lld,1970/01/01 00:00:00,0,0,0,%s\n",
+			       csv_escape(path).c_str(), sz, alloc, hex.c_str());
 		}
 	}
 
@@ -385,7 +435,7 @@ int main(int argc, char **argv)
 		if (!mappings.empty()) path = apply_mappings(path, mappings);
 		slash_to_backslash(path);
 		if (!replacements.empty()) apply_replacements(path, replacements);
-		printf("\"%s\\\",%lld,%lld,1970/01/01 00:00:00,0,%lld,%lld\n",
+		printf("\"%s\\\",%lld,%lld,1970/01/01 00:00:00,0,%lld,%lld,\n",
 		       csv_escape(path).c_str(), ds.total_size, ds.total_allocated,
 		       ds.file_count, ds.folder_count);
 	}

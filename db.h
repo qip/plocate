@@ -13,7 +13,7 @@ struct Header {
 	uint64_t filename_index_offset_bytes;
 
 	// Version 1 and up only.
-	uint32_t max_version;  // Nominally 1, 2, or 3. Can be increased for backward-compatible extensions.
+	uint32_t max_version;  // Nominally 1, 2, 3, or 4. Can be increased for backward-compatible extensions.
 	uint32_t zstd_dictionary_length_bytes;
 	uint64_t zstd_dictionary_offset_bytes;
 
@@ -32,6 +32,10 @@ struct Header {
 	uint64_t filesize_data_length_bytes;
 	uint64_t filesize_data_offset_bytes;
 	uint32_t block_size;
+
+	// Only if max_version >= 4.
+	uint64_t checksum_data_length_bytes;
+	uint64_t checksum_data_offset_bytes;
 };
 
 struct Trigram {
