@@ -64,6 +64,10 @@ static bool in_forked_child = false;
 steady_clock::time_point start;
 ZSTD_DDict *ddict = nullptr;
 
+static int64_t *filesize_array = nullptr;
+static size_t filesize_total_files = 0;
+static uint32_t db_block_size = 0;
+
 class Corpus {
 public:
 	Corpus(int fd, const char *filename_for_errors, IOUringEngine *engine);
@@ -111,8 +115,12 @@ Corpus::Corpus(int fd, const char *filename_for_errors, IOUringEngine *engine)
 		hdr.zstd_dictionary_length_bytes = 0;
 	}
 	if (hdr.max_version < 2) {
-		// This too. (We ignore the other max_version 2 fields.)
 		hdr.check_visibility = true;
+	}
+	if (hdr.max_version < 3) {
+		hdr.filesize_data_length_bytes = 0;
+		hdr.filesize_data_offset_bytes = 0;
+		hdr.block_size = 0;
 	}
 }
 
@@ -171,9 +179,56 @@ void stat_if_needed(const char *filename, bool access_ok, IOUringEngine *engine,
 	}
 }
 
+static void load_filesize_data(int fd, const Header &hdr)
+{
+	if (hdr.filesize_data_length_bytes == 0 || hdr.block_size == 0)
+		return;
+
+	string compressed(hdr.filesize_data_length_bytes, '\0');
+	complete_pread(fd, &compressed[0], hdr.filesize_data_length_bytes, hdr.filesize_data_offset_bytes);
+
+	ZSTD_DCtx *ctx = ZSTD_createDCtx();
+	string decompressed;
+	ZSTD_inBuffer in = { compressed.data(), compressed.size(), 0 };
+	while (in.pos < in.size) {
+		char outbuf[65536];
+		ZSTD_outBuffer out = { outbuf, sizeof(outbuf), 0 };
+		size_t ret = ZSTD_decompressStream(ctx, &out, &in);
+		if (ZSTD_isError(ret)) {
+			fprintf(stderr, "ZSTD_decompressStream() for filesize data: %s\n", ZSTD_getErrorName(ret));
+			ZSTD_freeDCtx(ctx);
+			return;
+		}
+		decompressed.append(outbuf, out.pos);
+	}
+	ZSTD_freeDCtx(ctx);
+
+	filesize_total_files = decompressed.size() / (2 * sizeof(int64_t));
+	if (filesize_total_files == 0)
+		return;
+
+	filesize_array = new int64_t[filesize_total_files * 2];
+	memcpy(filesize_array, decompressed.data(), filesize_total_files * 2 * sizeof(int64_t));
+	db_block_size = hdr.block_size;
+}
+
+static string format_with_filesize(const char *filename, uint32_t docid, uint32_t local_file_idx)
+{
+	if (filesize_array == nullptr || db_block_size == 0)
+		return filename;
+
+	size_t global_idx = (size_t)docid * db_block_size + local_file_idx;
+	if (global_idx >= filesize_total_files)
+		return filename;
+
+	return string(filename) + "," +
+	       to_string(filesize_array[global_idx * 2]) + "," +
+	       to_string(filesize_array[global_idx * 2 + 1]);
+}
+
 void scan_file_block(const vector<Needle> &needles, string_view compressed,
-                     IOUringEngine *engine, AccessRXCache *access_rx_cache, uint64_t seq, ResultReceiver *serializer,
-                     atomic<uint64_t> *matched)
+                     IOUringEngine *engine, AccessRXCache *access_rx_cache, uint64_t seq, uint32_t docid,
+                     ResultReceiver *serializer, atomic<uint64_t> *matched)
 {
 	unsigned long long uncompressed_len = ZSTD_getFrameContentSize(compressed.data(), compressed.size());
 	if (uncompressed_len == ZSTD_CONTENTSIZE_UNKNOWN || uncompressed_len == ZSTD_CONTENTSIZE_ERROR) {
@@ -200,12 +255,12 @@ void scan_file_block(const vector<Needle> &needles, string_view compressed,
 	}
 	block[block.size() - 1] = '\0';
 
-	auto test_candidate = [&](const char *filename, uint64_t local_seq, uint64_t next_seq) {
-		access_rx_cache->check_access(filename, /*allow_async=*/true, [matched, engine, serializer, local_seq, next_seq, filename{ strdup(filename) }](bool ok) {
-			stat_if_needed(filename, ok, engine, [matched, serializer, local_seq, next_seq, filename](bool ok) {
+	auto test_candidate = [&](const char *filename, const string &display, uint64_t local_seq, uint64_t next_seq) {
+		access_rx_cache->check_access(filename, /*allow_async=*/true, [matched, engine, serializer, local_seq, next_seq, filename{ strdup(filename) }, display](bool ok) {
+			stat_if_needed(filename, ok, engine, [matched, serializer, local_seq, next_seq, filename, display](bool ok) {
 				if (ok) {
 					++*matched;
-					serializer->print(local_seq, next_seq - local_seq, filename);
+					serializer->print(local_seq, next_seq - local_seq, display);
 				} else {
 					serializer->print(local_seq, next_seq - local_seq, "");
 				}
@@ -217,27 +272,18 @@ void scan_file_block(const vector<Needle> &needles, string_view compressed,
 	// We need to know the next sequence number before inserting into Serializer,
 	// so always buffer one candidate.
 	const char *pending_candidate = nullptr;
+	string pending_display;
 
 	uint64_t local_seq = seq << 32;
+	uint32_t local_file_idx = 0;
 	for (const char *filename = block.data();
 	     filename != block.data() + block.size();
-	     filename += strlen(filename) + 1) {
-        const char *last_delimiter_position = strrchr(filename, ',');
-        const char *second_to_last_delimiter_position = last_delimiter_position - 1;
-        while(second_to_last_delimiter_position >= filename && *second_to_last_delimiter_position != ',') {
-            second_to_last_delimiter_position--;
-        }
-        size_t new_length = second_to_last_delimiter_position - filename;
-        char * hay = (char *)malloc(new_length + 1);
-        memcpy(hay, filename, new_length);
-        hay[new_length] = '\0';
-		const char *haystack = hay;
+	     filename += strlen(filename) + 1, ++local_file_idx) {
+		const char *haystack = filename;
 		if (match_basename) {
-			haystack = strrchr(hay, '/');
-			if (haystack == nullptr) {
-				haystack = hay;
-			} else {
-				++haystack;
+			const char *slash = strrchr(filename, '/');
+			if (slash != nullptr) {
+				haystack = slash + 1;
 			}
 		}
 
@@ -250,16 +296,17 @@ void scan_file_block(const vector<Needle> &needles, string_view compressed,
 		}
 		if (found) {
 			if (pending_candidate != nullptr) {
-				test_candidate(pending_candidate, local_seq, local_seq + 1);
+				test_candidate(pending_candidate, pending_display, local_seq, local_seq + 1);
 				++local_seq;
 			}
 			pending_candidate = filename;
+			pending_display = format_with_filesize(filename, docid, local_file_idx);
 		}
 	}
 	if (pending_candidate == nullptr) {
 		serializer->print(seq << 32, 1ULL << 32, "");
 	} else {
-		test_candidate(pending_candidate, local_seq, (seq + 1) << 32);
+		test_candidate(pending_candidate, pending_display, local_seq, (seq + 1) << 32);
 	}
 }
 
@@ -270,8 +317,8 @@ size_t scan_docids(const vector<Needle> &needles, const vector<uint32_t> &docids
 	atomic<uint64_t> matched{ 0 };
 	for (size_t i = 0; i < docids.size(); ++i) {
 		uint32_t docid = docids[i];
-		corpus.get_compressed_filename_block(docid, [i, &matched, &needles, &access_rx_cache, engine, &docids_in_order](string_view compressed) {
-			scan_file_block(needles, compressed, engine, &access_rx_cache, i, &docids_in_order, &matched);
+		corpus.get_compressed_filename_block(docid, [i, docid, &matched, &needles, &access_rx_cache, engine, &docids_in_order](string_view compressed) {
+			scan_file_block(needles, compressed, engine, &access_rx_cache, i, docid, &docids_in_order, &matched);
 		});
 	}
 	engine->finish();
@@ -390,7 +437,7 @@ uint64_t scan_all_docids(const vector<Needle> &needles, int fd, const Corpus &co
 					size_t relative_offset = offsets[docid] - offsets[io_docid];
 					size_t len = offsets[docid + 1] - offsets[docid];
 					// IOUringEngine isn't thread-safe, so we do any needed stat()s synchronously (nullptr engine).
-					scan_file_block(*use_needles, { &compressed[relative_offset], len }, /*engine=*/nullptr, &access_rx_cache, docid, &receiver, &matched);
+					scan_file_block(*use_needles, { &compressed[relative_offset], len }, /*engine=*/nullptr, &access_rx_cache, docid, docid, &receiver, &matched);
 				}
 			}
 		});
@@ -499,6 +546,7 @@ uint64_t do_search_file(const vector<Needle> &needles, const std::string &filena
 
 	IOUringEngine engine(/*slop_bytes=*/16);  // 16 slop bytes as described in turbopfor.h.
 	Corpus corpus(fd, filename.c_str(), &engine);
+	load_filesize_data(fd, corpus.get_hdr());
 	dprintf("Corpus init done after %.1f ms.\n", 1e3 * duration<float>(steady_clock::now() - start).count());
 
 	vector<TrigramDisjunction> trigram_groups;

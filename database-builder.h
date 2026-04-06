@@ -39,7 +39,7 @@ constexpr dir_time not_a_dir{ -1, 0 };
 class DatabaseReceiver {
 public:
 	virtual ~DatabaseReceiver() = default;
-	virtual void add_file(std::string filename, dir_time dt) = 0;
+	virtual void add_file(std::string filename, dir_time dt, int64_t filesize = -1, int64_t allocated = -1) = 0;
 	virtual void flush_block() = 0;
 	virtual void finish() { flush_block(); }
 
@@ -51,7 +51,7 @@ class DictionaryBuilder : public DatabaseReceiver {
 public:
 	DictionaryBuilder(size_t blocks_to_keep, size_t block_size)
 		: blocks_to_keep(blocks_to_keep), block_size(block_size) {}
-	void add_file(std::string filename, dir_time dt) override;
+	void add_file(std::string filename, dir_time dt, int64_t filesize = -1, int64_t allocated = -1) override;
 	void flush_block() override;
 	std::string train(size_t buf_size);
 
@@ -74,7 +74,7 @@ class EncodingCorpus;
 class DatabaseBuilder {
 public:
 	DatabaseBuilder(const char *outfile, gid_t owner, int block_size, std::string dictionary, bool check_visibility);
-	DatabaseReceiver *start_corpus(bool store_dir_times);
+	DatabaseReceiver *start_corpus(bool store_dir_times, bool store_filesizes = false);
 	void set_next_dictionary(std::string next_dictionary);
 	void set_conf_block(std::string conf_block);
 	void finish_corpus();

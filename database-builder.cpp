@@ -108,7 +108,7 @@ void PostingListBuilder::write_header(uint32_t docid)
 	encoded.insert(encoded.end(), buf, end);
 }
 
-void DictionaryBuilder::add_file(string filename, dir_time)
+void DictionaryBuilder::add_file(string filename, dir_time, int64_t, int64_t)
 {
 	if (keep_current_block) {  // Only bother saving the filenames if we're actually keeping the block.
 		if (!current_block.empty()) {
@@ -172,10 +172,10 @@ string DictionaryBuilder::train(size_t buf_size)
 
 class EncodingCorpus : public DatabaseReceiver {
 public:
-	EncodingCorpus(FILE *outfp, size_t block_size, ZSTD_CDict *cdict, bool store_dir_times);
+	EncodingCorpus(FILE *outfp, size_t block_size, ZSTD_CDict *cdict, bool store_dir_times, bool store_filesizes);
 	~EncodingCorpus();
 
-	void add_file(std::string filename, dir_time dt) override;
+	void add_file(std::string filename, dir_time dt, int64_t filesize = -1, int64_t allocated = -1) override;
 	void flush_block() override;
 	void finish() override;
 
@@ -203,9 +203,11 @@ public:
 
 	size_t num_trigrams() const;
 	std::string get_compressed_dir_times();
+	std::string get_compressed_filesizes();
 
 private:
 	void compress_dir_times(size_t allowed_slop);
+	void compress_filesizes(size_t allowed_slop);
 
 	std::unique_ptr<PostingListBuilder *[]> invindex;
 	FILE *outfp;
@@ -214,20 +216,29 @@ private:
 	std::string tempbuf;
 	const size_t block_size;
 	const bool store_dir_times;
+	const bool store_filesizes;
 	ZSTD_CDict *cdict;
 
 	ZSTD_CStream *dir_time_ctx = nullptr;
-	std::string dir_times;  // Buffer of still-uncompressed data.
+	std::string dir_times;
 	std::string dir_times_compressed;
+
+	ZSTD_CStream *filesize_ctx = nullptr;
+	std::string filesizes;
+	std::string filesizes_compressed;
 };
 
-EncodingCorpus::EncodingCorpus(FILE *outfp, size_t block_size, ZSTD_CDict *cdict, bool store_dir_times)
-	: invindex(new PostingListBuilder *[NUM_TRIGRAMS]), outfp(outfp), outfp_pos(ftell(outfp)), block_size(block_size), store_dir_times(store_dir_times), cdict(cdict)
+EncodingCorpus::EncodingCorpus(FILE *outfp, size_t block_size, ZSTD_CDict *cdict, bool store_dir_times, bool store_filesizes)
+	: invindex(new PostingListBuilder *[NUM_TRIGRAMS]), outfp(outfp), outfp_pos(ftell(outfp)), block_size(block_size), store_dir_times(store_dir_times), store_filesizes(store_filesizes), cdict(cdict)
 {
 	fill(invindex.get(), invindex.get() + NUM_TRIGRAMS, nullptr);
 	if (store_dir_times) {
 		dir_time_ctx = ZSTD_createCStream();
 		ZSTD_initCStream(dir_time_ctx, /*level=*/6);
+	}
+	if (store_filesizes) {
+		filesize_ctx = ZSTD_createCStream();
+		ZSTD_initCStream(filesize_ctx, /*level=*/6);
 	}
 }
 
@@ -238,7 +249,7 @@ EncodingCorpus::~EncodingCorpus()
 	}
 }
 
-void EncodingCorpus::add_file(string filename, dir_time dt)
+void EncodingCorpus::add_file(string filename, dir_time dt, int64_t filesize, int64_t allocated)
 {
 	++num_files;
 	if (!current_block.empty()) {
@@ -251,7 +262,6 @@ void EncodingCorpus::add_file(string filename, dir_time dt)
 
 	if (store_dir_times) {
 		if (dt.sec == -1) {
-			// Not a directory.
 			dir_times.push_back('\0');
 		} else {
 			dir_times.push_back('\1');
@@ -259,6 +269,12 @@ void EncodingCorpus::add_file(string filename, dir_time dt)
 			dir_times.append(reinterpret_cast<char *>(&dt.nsec), sizeof(dt.nsec));
 		}
 		compress_dir_times(/*allowed_slop=*/4096);
+	}
+
+	if (store_filesizes) {
+		filesizes.append(reinterpret_cast<const char *>(&filesize), sizeof(filesize));
+		filesizes.append(reinterpret_cast<const char *>(&allocated), sizeof(allocated));
+		compress_filesizes(/*allowed_slop=*/4096);
 	}
 }
 
@@ -289,6 +305,37 @@ void EncodingCorpus::compress_dir_times(size_t allowed_slop)
 
 		if (outbuf.pos == 0 && inbuf.pos == 0) {
 			// Nothing happened (not enough data?), try again later.
+			return;
+		}
+	}
+}
+
+void EncodingCorpus::compress_filesizes(size_t allowed_slop)
+{
+	while (filesizes.size() >= allowed_slop) {
+		size_t old_size = filesizes_compressed.size();
+		filesizes_compressed.resize(old_size + 4096);
+
+		ZSTD_outBuffer outbuf;
+		outbuf.dst = filesizes_compressed.data() + old_size;
+		outbuf.size = 4096;
+		outbuf.pos = 0;
+
+		ZSTD_inBuffer inbuf;
+		inbuf.src = filesizes.data();
+		inbuf.size = filesizes.size();
+		inbuf.pos = 0;
+
+		int ret = ZSTD_compressStream(filesize_ctx, &outbuf, &inbuf);
+		if (ret < 0) {
+			fprintf(stderr, "ZSTD_compressStream() failed\n");
+			exit(1);
+		}
+
+		filesizes_compressed.resize(old_size + outbuf.pos);
+		filesizes.erase(filesizes.begin(), filesizes.begin() + inbuf.pos);
+
+		if (outbuf.pos == 0 && inbuf.pos == 0) {
 			return;
 		}
 	}
@@ -398,6 +445,39 @@ string EncodingCorpus::get_compressed_dir_times()
 	}
 
 	return dir_times_compressed;
+}
+
+string EncodingCorpus::get_compressed_filesizes()
+{
+	if (!store_filesizes) {
+		return "";
+	}
+	compress_filesizes(/*allowed_slop=*/0);
+	assert(filesizes.empty());
+
+	for (;;) {
+		size_t old_size = filesizes_compressed.size();
+		filesizes_compressed.resize(old_size + 4096);
+
+		ZSTD_outBuffer outbuf;
+		outbuf.dst = filesizes_compressed.data() + old_size;
+		outbuf.size = 4096;
+		outbuf.pos = 0;
+
+		int ret = ZSTD_endStream(filesize_ctx, &outbuf);
+		if (ret < 0) {
+			fprintf(stderr, "ZSTD_endStream() failed\n");
+			exit(1);
+		}
+
+		filesizes_compressed.resize(old_size + outbuf.pos);
+
+		if (ret == 0) {
+			break;
+		}
+	}
+
+	return filesizes_compressed;
 }
 
 string zstd_compress(const string &src, ZSTD_CDict *cdict, string *tempbuf)
@@ -528,7 +608,7 @@ DatabaseBuilder::DatabaseBuilder(const char *outfile, gid_t owner, int block_siz
 	hdr.extra_ht_slots = num_overflow_slots;
 	hdr.num_docids = 0;
 	hdr.hash_table_offset_bytes = -1;  // We don't know these offsets yet.
-	hdr.max_version = 2;
+	hdr.max_version = 3;
 	hdr.filename_index_offset_bytes = -1;
 	hdr.zstd_dictionary_length_bytes = -1;
 	hdr.check_visibility = check_visibility;
@@ -550,12 +630,15 @@ DatabaseBuilder::DatabaseBuilder(const char *outfile, gid_t owner, int block_siz
 	hdr.next_zstd_dictionary_offset_bytes = 0;
 	hdr.conf_block_length_bytes = 0;
 	hdr.conf_block_offset_bytes = 0;
+	hdr.filesize_data_length_bytes = 0;
+	hdr.filesize_data_offset_bytes = 0;
+	hdr.block_size = block_size;
 }
 
-DatabaseReceiver *DatabaseBuilder::start_corpus(bool store_dir_times)
+DatabaseReceiver *DatabaseBuilder::start_corpus(bool store_dir_times, bool store_filesizes)
 {
 	corpus_start = steady_clock::now();
-	corpus = new EncodingCorpus(outfp, block_size, cdict, store_dir_times);
+	corpus = new EncodingCorpus(outfp, block_size, cdict, store_dir_times, store_filesizes);
 	return corpus;
 }
 
@@ -664,6 +747,17 @@ void DatabaseBuilder::finish_corpus()
 		compressed_dir_times.clear();
 	}
 
+	// Write the filesize data (for plocate2csv / updatedb).
+	string compressed_filesizes = corpus->get_compressed_filesizes();
+	size_t bytes_for_compressed_filesizes = 0;
+	if (!compressed_filesizes.empty()) {
+		hdr.filesize_data_offset_bytes = ftell(outfp);
+		hdr.filesize_data_length_bytes = compressed_filesizes.size();
+		fwrite(compressed_filesizes.data(), compressed_filesizes.size(), 1, outfp);
+		bytes_for_compressed_filesizes = compressed_filesizes.size();
+		compressed_filesizes.clear();
+	}
+
 	// Write the recommended dictionary for next update.
 	if (!next_dictionary.empty()) {
 		hdr.next_zstd_dictionary_offset_bytes = ftell(outfp);
@@ -704,7 +798,7 @@ void DatabaseBuilder::finish_corpus()
 
 	fclose(outfp);
 
-	size_t total_bytes = (bytes_for_hashtable + bytes_for_posting_lists + bytes_for_filename_index + bytes_for_filenames + bytes_for_compressed_dir_times);
+	size_t total_bytes = (bytes_for_hashtable + bytes_for_posting_lists + bytes_for_filename_index + bytes_for_filenames + bytes_for_compressed_dir_times + bytes_for_compressed_filesizes);
 
 	dprintf("Block size:     %7d files\n", block_size);
 	dprintf("Dictionary:     %'7.1f MB\n", hdr.zstd_dictionary_length_bytes / 1048576.0);
@@ -714,6 +808,9 @@ void DatabaseBuilder::finish_corpus()
 	dprintf("Filenames:      %'7.1f MB\n", bytes_for_filenames / 1048576.0);
 	if (bytes_for_compressed_dir_times != 0) {
 		dprintf("Modify times:   %'7.1f MB\n", bytes_for_compressed_dir_times / 1048576.0);
+	}
+	if (bytes_for_compressed_filesizes != 0) {
+		dprintf("File sizes:     %'7.1f MB\n", bytes_for_compressed_filesizes / 1048576.0);
 	}
 	dprintf("Total:          %'7.1f MB\n", total_bytes / 1048576.0);
 	dprintf("\n");

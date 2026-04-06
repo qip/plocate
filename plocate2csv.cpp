@@ -118,25 +118,6 @@ static bool parse_mapping(const char *arg, PathMapping *out)
 	return true;
 }
 
-// Extract the path, size, and allocated from a null-terminated db string.
-// Format: "path,filesize,allocated". Returns false if parsing fails.
-static bool parse_entry(const char *p, FileEntry *out)
-{
-	const char *last_comma = strrchr(p, ',');
-	if (last_comma == nullptr || last_comma == p) return false;
-
-	const char *second_last_comma = last_comma - 1;
-	while (second_last_comma > p && *second_last_comma != ',') {
-		--second_last_comma;
-	}
-	if (*second_last_comma != ',') return false;
-
-	out->path.assign(p, second_last_comma - p);
-	out->size = atoll(second_last_comma + 1);
-	out->allocated = atoll(last_comma + 1);
-	return true;
-}
-
 // Walk all '/' positions in path and call fn(parent) for each ancestor.
 template <typename Fn>
 static void for_each_ancestor(const string &path, Fn fn)
@@ -224,6 +205,11 @@ int main(int argc, char **argv)
 		hdr.zstd_dictionary_offset_bytes = 0;
 		hdr.zstd_dictionary_length_bytes = 0;
 	}
+	if (hdr.max_version < 3) {
+		hdr.filesize_data_length_bytes = 0;
+		hdr.filesize_data_offset_bytes = 0;
+		hdr.block_size = 0;
+	}
 
 	ZSTD_DDict *ddict = nullptr;
 	if (hdr.zstd_dictionary_length_bytes > 0) {
@@ -238,6 +224,31 @@ int main(int argc, char **argv)
 	vector<uint64_t> offsets(num_blocks + 1);
 	complete_pread(fd, offsets.data(), (num_blocks + 1) * sizeof(uint64_t),
 	               hdr.filename_index_offset_bytes);
+
+	// Decompress the filesize stream if present.
+	string filesize_data;
+	if (hdr.filesize_data_length_bytes > 0) {
+		string compressed_fs(hdr.filesize_data_length_bytes, '\0');
+		complete_pread(fd, &compressed_fs[0], hdr.filesize_data_length_bytes,
+		               hdr.filesize_data_offset_bytes);
+
+		unsigned long long fs_uncompressed =
+			ZSTD_getFrameContentSize(compressed_fs.data(), compressed_fs.size());
+		if (fs_uncompressed != ZSTD_CONTENTSIZE_UNKNOWN &&
+		    fs_uncompressed != ZSTD_CONTENTSIZE_ERROR) {
+			filesize_data.resize(fs_uncompressed);
+			ZSTD_DCtx *fs_ctx = ZSTD_createDCtx();
+			size_t ret = ZSTD_decompressDCtx(fs_ctx, &filesize_data[0], filesize_data.size(),
+			                                  compressed_fs.data(), compressed_fs.size());
+			if (ZSTD_isError(ret)) {
+				fprintf(stderr, "filesize stream: ZSTD_decompress: %s\n", ZSTD_getErrorName(ret));
+				filesize_data.clear();
+			}
+			ZSTD_freeDCtx(fs_ctx);
+		}
+	}
+	const int64_t *filesize_ptr = reinterpret_cast<const int64_t *>(filesize_data.data());
+	const int64_t *filesize_end = reinterpret_cast<const int64_t *>(filesize_data.data() + filesize_data.size());
 
 	ZSTD_DCtx *ctx = ZSTD_createDCtx();
 
@@ -278,8 +289,14 @@ int main(int argc, char **argv)
 		for (const char *p = data.data(); p < data.data() + data.size(); p += strlen(p) + 1) {
 			if (*p == '\0') continue;
 			FileEntry e;
-			if (!parse_entry(p, &e)) {
-				e = FileEntry{ string(p), 0, 0 };
+			e.path = string(p);
+			if (filesize_ptr + 1 < filesize_end) {
+				e.size = filesize_ptr[0];
+				e.allocated = filesize_ptr[1];
+				filesize_ptr += 2;
+			} else {
+				e.size = 0;
+				e.allocated = 0;
 			}
 			if (!filter_prefix.empty()) {
 				bool path_under_prefix =

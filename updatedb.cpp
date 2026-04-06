@@ -265,13 +265,20 @@ dir_time get_dirtime_from_stat(const struct stat &buf)
 }
 
 // Represents the old database we are updating.
+struct db_record {
+	string path;
+	dir_time dt;
+	int64_t filesize = -1;
+	int64_t allocated = -1;
+};
+
 class ExistingDB {
 public:
 	explicit ExistingDB(int fd);
 	~ExistingDB();
 
-	pair<string, dir_time> read_next();
-	void unread(pair<string, dir_time> record)
+	db_record read_next();
+	void unread(db_record record)
 	{
 		unread_record = move(record);
 	}
@@ -292,18 +299,23 @@ private:
 	string current_dir_time_block;
 	const char *current_dir_time_ptr = nullptr, *current_dir_time_end = nullptr;
 
-	pair<string, dir_time> unread_record;
+	bool has_filesize_data = false;
+	off_t compressed_filesize_pos;
+	string compressed_filesize;
+	string current_filesize_block;
+	const char *current_filesize_ptr = nullptr, *current_filesize_end = nullptr;
+
+	db_record unread_record;
 
 	// Used in one-shot mode, repeatedly.
 	ZSTD_DCtx *ctx;
 
 	// Used in streaming mode.
 	ZSTD_DCtx *dir_time_ctx;
+	ZSTD_DCtx *filesize_ctx = nullptr;
 
 	ZSTD_DDict *ddict = nullptr;
 
-	// If true, we've discovered an error or EOF, and will return only
-	// empty data from here.
 	bool eof = false, error = false;
 };
 
@@ -379,6 +391,16 @@ ExistingDB::ExistingDB(int fd)
 	}
 	compressed_dir_time_pos = hdr.directory_data_offset_bytes;
 
+	if (hdr.max_version >= 3 && hdr.filesize_data_length_bytes > 0) {
+		has_filesize_data = true;
+		compressed_filesize_pos = hdr.filesize_data_offset_bytes;
+		filesize_ctx = ZSTD_createDCtx();
+	} else {
+		hdr.filesize_data_length_bytes = 0;
+		hdr.filesize_data_offset_bytes = 0;
+		hdr.block_size = 0;
+	}
+
 	ctx = ZSTD_createDCtx();
 	dir_time_ctx = ZSTD_createDCtx();
 }
@@ -390,23 +412,23 @@ ExistingDB::~ExistingDB()
 	}
 }
 
-pair<string, dir_time> ExistingDB::read_next()
+db_record ExistingDB::read_next()
 {
-	if (!unread_record.first.empty()) {
+	if (!unread_record.path.empty()) {
 		auto ret = move(unread_record);
-		unread_record.first.clear();
+		unread_record.path.clear();
 		return ret;
 	}
 
 	if (eof || error) {
-		return { "", not_a_dir };
+		return { "", not_a_dir, -1, -1 };
 	}
 
 	// See if we need to read a new filename block.
 	if (current_filename_ptr == nullptr) {
 		if (current_docid >= hdr.num_docids) {
 			eof = true;
-			return { "", not_a_dir };
+			return { "", not_a_dir, -1, -1 };
 		}
 
 		// Read the file offset from this docid and the next one.
@@ -418,7 +440,7 @@ pair<string, dir_time> ExistingDB::read_next()
 				perror("pread(offset)");
 			}
 			error = true;
-			return { "", not_a_dir };
+			return { "", not_a_dir, -1, -1 };
 		}
 
 		off_t offset = vals[0];
@@ -429,7 +451,7 @@ pair<string, dir_time> ExistingDB::read_next()
 				perror("pread(block)");
 			}
 			error = true;
-			return { "", not_a_dir };
+			return { "", not_a_dir, -1, -1 };
 		}
 
 		unsigned long long uncompressed_len = ZSTD_getFrameContentSize(compressed.get(), compressed_len);
@@ -438,7 +460,7 @@ pair<string, dir_time> ExistingDB::read_next()
 				fprintf(stderr, "ZSTD_getFrameContentSize() failed\n");
 			}
 			error = true;
-			return { "", not_a_dir };
+			return { "", not_a_dir, -1, -1 };
 		}
 
 		string block;
@@ -457,7 +479,7 @@ pair<string, dir_time> ExistingDB::read_next()
 				fprintf(stderr, "ZSTD_decompress(): %s\n", ZSTD_getErrorName(err));
 			}
 			error = true;
-			return { "", not_a_dir };
+			return { "", not_a_dir, -1, -1 };
 		}
 		block[block.size() - 1] = '\0';
 		current_filename_block = move(block);
@@ -475,7 +497,6 @@ pair<string, dir_time> ExistingDB::read_next()
 			current_dir_time_block.erase(current_dir_time_block.begin(), current_dir_time_block.begin() + bytes_consumed);
 		}
 
-		// See if we can get more data out without reading more.
 		const size_t existing_data = current_dir_time_block.size();
 		current_dir_time_block.resize(existing_data + 4096);
 
@@ -495,57 +516,121 @@ pair<string, dir_time> ExistingDB::read_next()
 				fprintf(stderr, "ZSTD_decompress(): %s\n", ZSTD_getErrorName(err));
 			}
 			error = true;
-			return { "", not_a_dir };
+			return { "", not_a_dir, -1, -1 };
 		}
 		compressed_dir_time.erase(compressed_dir_time.begin(), compressed_dir_time.begin() + inbuf.pos);
 		current_dir_time_block.resize(existing_data + outbuf.pos);
 
 		if (inbuf.pos == 0 && outbuf.pos == 0) {
-			// No movement, we'll need to try to read more data.
 			char buf[4096];
 			size_t bytes_to_read = min<size_t>(
 				hdr.directory_data_offset_bytes + hdr.directory_data_length_bytes - compressed_dir_time_pos,
 				sizeof(buf));
 			if (bytes_to_read == 0) {
 				error = true;
-				return { "", not_a_dir };
+				return { "", not_a_dir, -1, -1 };
 			}
 			if (!try_complete_pread(fd, buf, bytes_to_read, compressed_dir_time_pos)) {
 				if (conf_verbose) {
 					perror("pread(dirtime)");
 				}
 				error = true;
-				return { "", not_a_dir };
+				return { "", not_a_dir, -1, -1 };
 			}
 			compressed_dir_time_pos += bytes_to_read;
 			compressed_dir_time.insert(compressed_dir_time.end(), buf, buf + bytes_to_read);
-
-			// Next iteration will now try decompressing more.
 		}
 
 		current_dir_time_ptr = current_dir_time_block.data();
 		current_dir_time_end = current_dir_time_block.data() + current_dir_time_block.size();
 	}
 
+	// Read filesize data if available.
+	int64_t filesize = -1, allocated = -1;
+	constexpr size_t filesize_record_size = sizeof(int64_t) * 2;
+	if (has_filesize_data) {
+		while (current_filesize_ptr == current_filesize_end ||
+		       size_t(current_filesize_end - current_filesize_ptr) < filesize_record_size) {
+			if (current_filesize_ptr != nullptr) {
+				const size_t bytes_consumed = current_filesize_ptr - current_filesize_block.data();
+				current_filesize_block.erase(current_filesize_block.begin(), current_filesize_block.begin() + bytes_consumed);
+			}
+
+			const size_t existing_data = current_filesize_block.size();
+			current_filesize_block.resize(existing_data + 4096);
+
+			ZSTD_outBuffer outbuf;
+			outbuf.dst = current_filesize_block.data() + existing_data;
+			outbuf.size = 4096;
+			outbuf.pos = 0;
+
+			ZSTD_inBuffer inbuf;
+			inbuf.src = compressed_filesize.data();
+			inbuf.size = compressed_filesize.size();
+			inbuf.pos = 0;
+
+			int err = ZSTD_decompressStream(filesize_ctx, &outbuf, &inbuf);
+			if (err < 0) {
+				if (conf_verbose) {
+					fprintf(stderr, "ZSTD_decompress(filesize): %s\n", ZSTD_getErrorName(err));
+				}
+				has_filesize_data = false;
+				break;
+			}
+			compressed_filesize.erase(compressed_filesize.begin(), compressed_filesize.begin() + inbuf.pos);
+			current_filesize_block.resize(existing_data + outbuf.pos);
+
+			if (inbuf.pos == 0 && outbuf.pos == 0) {
+				char buf[4096];
+				size_t bytes_to_read = min<size_t>(
+					hdr.filesize_data_offset_bytes + hdr.filesize_data_length_bytes - compressed_filesize_pos,
+					sizeof(buf));
+				if (bytes_to_read == 0) {
+					has_filesize_data = false;
+					break;
+				}
+				if (!try_complete_pread(fd, buf, bytes_to_read, compressed_filesize_pos)) {
+					if (conf_verbose) {
+						perror("pread(filesize)");
+					}
+					has_filesize_data = false;
+					break;
+				}
+				compressed_filesize_pos += bytes_to_read;
+				compressed_filesize.insert(compressed_filesize.end(), buf, buf + bytes_to_read);
+			}
+
+			current_filesize_ptr = current_filesize_block.data();
+			current_filesize_end = current_filesize_block.data() + current_filesize_block.size();
+		}
+
+		if (has_filesize_data && size_t(current_filesize_end - current_filesize_ptr) >= filesize_record_size) {
+			memcpy(&filesize, current_filesize_ptr, sizeof(filesize));
+			current_filesize_ptr += sizeof(filesize);
+			memcpy(&allocated, current_filesize_ptr, sizeof(allocated));
+			current_filesize_ptr += sizeof(allocated);
+		}
+	}
+
 	string filename = current_filename_ptr;
 	current_filename_ptr += filename.size() + 1;
 	if (current_filename_ptr == current_filename_end) {
-		// End of this block.
 		current_filename_ptr = nullptr;
 	}
 
+	dir_time dt;
 	if (*current_dir_time_ptr == 0) {
 		++current_dir_time_ptr;
-		return { move(filename), not_a_dir };
+		dt = not_a_dir;
 	} else {
 		++current_dir_time_ptr;
-		dir_time dt;
 		memcpy(&dt.sec, current_dir_time_ptr, sizeof(dt.sec));
 		current_dir_time_ptr += sizeof(dt.sec);
 		memcpy(&dt.nsec, current_dir_time_ptr, sizeof(dt.nsec));
 		current_dir_time_ptr += sizeof(dt.nsec);
-		return { move(filename), dt };
 	}
+
+	return { move(filename), dt, filesize, allocated };
 }
 
 string ExistingDB::read_next_dictionary() const
@@ -612,11 +697,11 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 	// Skip over anything before this directory; it is stuff that we would have
 	// consumed earlier if we wanted it.
 	for (;;) {
-		pair<string, dir_time> record = existing_db->read_next();
-		if (record.first.empty()) {
+		db_record record = existing_db->read_next();
+		if (record.path.empty()) {
 			break;
 		}
-		if (dir_path_cmp(path, record.first) <= 0) {
+		if (dir_path_cmp(path, record.path) <= 0) {
 			existing_db->unread(move(record));
 			break;
 		}
@@ -626,32 +711,32 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 	vector<entry> db_entries;
 	const string path_plus_slash = path.back() == '/' ? path : path + '/';
 	for (;;) {
-		pair<string, dir_time> record = existing_db->read_next();
-		if (record.first.empty()) {
+		db_record record = existing_db->read_next();
+		if (record.path.empty()) {
 			break;
 		}
 
-		if (record.first.rfind(path_plus_slash, 0) != 0) {
-			// No longer starts with path, so we're in a different directory.
+		if (record.path.rfind(path_plus_slash, 0) != 0) {
 			existing_db->unread(move(record));
 			break;
 		}
-		if (record.first.find_first_of('/', path_plus_slash.size()) != string::npos) {
-			// Entered into a subdirectory of a subdirectory.
-			// Due to our ordering, this also means we're done.
+		if (record.path.find_first_of('/', path_plus_slash.size()) != string::npos) {
 			existing_db->unread(move(record));
 			break;
 		}
 
 		entry e;
-		e.name = record.first.substr(path_plus_slash.size());
-        struct stat buf;
-        if (fstatat(fd, e.name.c_str(), &buf, 0) == 0) {
-            e.filesize = buf.st_size;
-            e.allocated = buf.st_blocks * 512;
-        }
-		e.is_directory = (record.second.sec >= 0);
-		e.db_modified = record.second;
+		e.name = record.path.substr(path_plus_slash.size());
+		struct stat buf;
+		if (fstatat(fd, e.name.c_str(), &buf, 0) == 0) {
+			e.filesize = buf.st_size;
+			e.allocated = buf.st_blocks * 512;
+		} else if (record.filesize >= 0) {
+			e.filesize = record.filesize;
+			e.allocated = record.allocated;
+		}
+		e.is_directory = (record.dt.sec >= 0);
+		e.db_modified = record.dt;
 		db_entries.push_back(e);
 	}
 
@@ -819,9 +904,8 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 	for (const entry &e : entries) {
 		string entry_path = path_plus_slash + e.name;
 		if (path_is_excluded(entry_path) || !path_is_included(entry_path)) continue;
-		string stored = entry_path + "," + std::to_string(e.filesize) + "," + std::to_string(e.allocated);
-		corpus->add_file(stored, e.dt);
-		dict_builder->add_file(stored, e.dt);
+		corpus->add_file(entry_path, e.dt, e.filesize, e.allocated);
+		dict_builder->add_file(entry_path, e.dt);
 	}
 
 	// Now scan subdirectories.
@@ -887,7 +971,7 @@ int main(int argc, char **argv)
 
 	DatabaseBuilder db(conf_output.c_str(), owner, conf_block_size, existing_db.read_next_dictionary(), conf_check_visibility);
 	db.set_conf_block(conf_block);
-	DatabaseReceiver *corpus = db.start_corpus(/*store_dir_times=*/true);
+	DatabaseReceiver *corpus = db.start_corpus(/*store_dir_times=*/true, /*store_filesizes=*/true);
 
 	int root_fd = opendir_noatime(AT_FDCWD, conf_scan_root);
 	if (root_fd == -1) {
