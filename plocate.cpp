@@ -59,6 +59,9 @@ int64_t limit_matches = numeric_limits<int64_t>::max();
 int64_t limit_left = numeric_limits<int64_t>::max();
 bool stdout_is_tty = false;
 bool literal_printing = false;
+bool show_size = false;
+bool show_allocated = false;
+bool show_checksum = false;
 static bool in_forked_child = false;
 
 steady_clock::time_point start;
@@ -268,19 +271,30 @@ static string bytes_to_hex(const string &bytes)
 
 static string format_with_metadata(const char *filename, uint32_t docid, uint32_t local_file_idx)
 {
-	if (filesize_array == nullptr || db_block_size == 0)
+	if (!show_size && !show_allocated && !show_checksum)
 		return filename;
+
+	string result = filename;
 
 	size_t global_idx = (size_t)docid * db_block_size + local_file_idx;
-	if (global_idx >= filesize_total_files)
-		return filename;
 
-	string result = string(filename) + "," +
-	                to_string(filesize_array[global_idx * 2]) + "," +
-	                to_string(filesize_array[global_idx * 2 + 1]);
+	if ((show_size || show_allocated) && filesize_array != nullptr && db_block_size != 0 && global_idx < filesize_total_files) {
+		if (show_size)
+			result += "," + to_string(filesize_array[global_idx * 2]);
+		if (show_allocated)
+			result += "," + to_string(filesize_array[global_idx * 2 + 1]);
+	} else {
+		if (show_size)
+			result += ",";
+		if (show_allocated)
+			result += ",";
+	}
 
-	if (has_checksum_data && global_idx < checksum_array.size() && !checksum_array[global_idx].empty()) {
-		result += "," + bytes_to_hex(checksum_array[global_idx]);
+	if (show_checksum) {
+		if (has_checksum_data && global_idx < checksum_array.size() && !checksum_array[global_idx].empty())
+			result += "," + bytes_to_hex(checksum_array[global_idx]);
+		else
+			result += ",";
 	}
 
 	return result;
@@ -606,8 +620,10 @@ uint64_t do_search_file(const vector<Needle> &needles, const std::string &filena
 
 	IOUringEngine engine(/*slop_bytes=*/16);  // 16 slop bytes as described in turbopfor.h.
 	Corpus corpus(fd, filename.c_str(), &engine);
-	load_filesize_data(fd, corpus.get_hdr());
-	load_checksum_data(fd, corpus.get_hdr());
+	if (show_size || show_allocated)
+		load_filesize_data(fd, corpus.get_hdr());
+	if (show_checksum)
+		load_checksum_data(fd, corpus.get_hdr());
 	dprintf("Corpus init done after %.1f ms.\n", 1e3 * duration<float>(steady_clock::now() - start).count());
 
 	vector<TrigramDisjunction> trigram_groups;
@@ -932,6 +948,9 @@ void usage()
 		"  -r, --regexp           interpret patterns as basic regexps (slow)\n"
 		"      --regex            interpret patterns as extended regexps (slow)\n"
 		"  -w, --wholename        search the entire path name (default; see -b)\n"
+		"  -S, --size             print file size (bytes) after each match\n"
+		"  -a, --allocated        print allocated size (bytes) after each match\n"
+		"  -C, --checksum         print checksum (hex) after each match\n"
 		"      --help             print this help\n"
 		"      --version          print version information\n");
 }
@@ -967,6 +986,9 @@ int main(int argc, char **argv)
 		{ "regexp", no_argument, 0, 'r' },
 		{ "regex", no_argument, 0, EXTENDED_REGEX },
 		{ "wholename", no_argument, 0, 'w' },
+		{ "size", no_argument, 0, 'S' },
+		{ "allocated", no_argument, 0, 'a' },
+		{ "checksum", no_argument, 0, 'C' },
 		{ "debug", no_argument, 0, 'D' },  // Not documented.
 		// Enable to test cold-cache behavior (except for access()). Not documented.
 		{ "flush-cache", no_argument, 0, FLUSH_CACHE },
@@ -976,7 +998,7 @@ int main(int argc, char **argv)
 	setlocale(LC_ALL, "");
 	for (;;) {
 		int option_index = 0;
-		int c = getopt_long(argc, argv, "Abcd:ehil:n:N0rwVD", long_options, &option_index);
+		int c = getopt_long(argc, argv, "Abcd:ehil:n:N0rwVDSaC", long_options, &option_index);
 		if (c == -1) {
 			break;
 		}
@@ -1025,6 +1047,15 @@ int main(int argc, char **argv)
 			break;
 		case 'w':
 			match_basename = false;  // No-op unless -b is given first.
+			break;
+		case 'S':
+			show_size = true;
+			break;
+		case 'a':
+			show_allocated = true;
+			break;
+		case 'C':
+			show_checksum = true;
 			break;
 		case 'D':
 			use_debug = true;

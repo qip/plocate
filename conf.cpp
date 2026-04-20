@@ -79,6 +79,8 @@ bool use_debug = false;
 
 string conf_checksum_command;
 int64_t conf_min_checksum_size = 0;
+string conf_checksum_xattr;
+string conf_checksum_xattr_mtime;
 
 /* Parse a STR, store the parsed boolean value to DEST;
    return 0 if OK, -1 on error. */
@@ -369,6 +371,14 @@ help(void)
 	         "                                 checksums are not computed\n"
 	         "      --min-checksum-size BYTES  skip checksum for files smaller\n"
 	         "                                 than BYTES (default 0)\n"
+	         "      --checksum-xattr ATTR      read checksum from file xattr\n"
+	         "                                 ATTR (e.g. user.checksum.sha256);\n"
+	         "                                 overrides --checksum-command\n"
+	         "      --checksum-xattr-mtime ATTR\n"
+	         "                                 xattr ATTR holding mtime when\n"
+	         "                                 checksum was computed; if older\n"
+	         "                                 than file, falls back to\n"
+	         "                                 --checksum-command\n"
 	         "\n"
 	         "The configuration defaults to values read from\n"
 	         "`%s'.\n"),
@@ -405,7 +415,9 @@ parse_arguments(int argc, char *argv[])
 	enum { OPT_DEBUG_PRUNING = CHAR_MAX + 1,
 	       OPT_ADD_SINGLE_PRUNEPATH = CHAR_MAX + 2,
 	       OPT_CHECKSUM_COMMAND = CHAR_MAX + 3,
-	       OPT_MIN_CHECKSUM_SIZE = CHAR_MAX + 4 };
+	       OPT_MIN_CHECKSUM_SIZE = CHAR_MAX + 4,
+	       OPT_CHECKSUM_XATTR = CHAR_MAX + 5,
+	       OPT_CHECKSUM_XATTR_MTIME = CHAR_MAX + 6 };
 
 	static const struct option options[] = {
 		{ "add-prunefs", required_argument, NULL, 'f' },
@@ -429,6 +441,8 @@ parse_arguments(int argc, char *argv[])
 		{ "debug", no_argument, 0, 'D' },  // Not documented.
 		{ "checksum-command", required_argument, NULL, OPT_CHECKSUM_COMMAND },
 		{ "min-checksum-size", required_argument, NULL, OPT_MIN_CHECKSUM_SIZE },
+		{ "checksum-xattr", required_argument, NULL, OPT_CHECKSUM_XATTR },
+		{ "checksum-xattr-mtime", required_argument, NULL, OPT_CHECKSUM_XATTR_MTIME },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -601,6 +615,14 @@ parse_arguments(int argc, char *argv[])
 			conf_min_checksum_size = atoll(optarg);
 			break;
 
+		case OPT_CHECKSUM_XATTR:
+			conf_checksum_xattr = optarg;
+			break;
+
+		case OPT_CHECKSUM_XATTR_MTIME:
+			conf_checksum_xattr_mtime = optarg;
+			break;
+
 		default:
 			abort();
 		}
@@ -675,6 +697,11 @@ void conf_prepare(int argc, char *argv[])
 	var_finish(&conf_prunefs);
 	var_finish(&conf_prunenames);
 	var_finish(&conf_prunepaths);
+	if (!conf_checksum_xattr_mtime.empty() && conf_checksum_command.empty()) {
+		fprintf(stderr, "%s: warning: --checksum-xattr-mtime is set but "
+			"--checksum-command is not; stale checksums cannot be recomputed\n",
+			program_invocation_name);
+	}
 	gen_conf_block();
 	string_list_dir_path_sort(&conf_prunepaths);
 

@@ -20,6 +20,9 @@ endif
 if cxx.has_header('endian.h')
 	add_project_arguments('-DHAS_ENDIAN_H', language: 'cpp')
 endif
+if cxx.has_header('sys/xattr.h')
+	add_project_arguments('-DHAS_XATTR', language: 'cpp')
+endif
 
 # Function multiversioning is x86-only _and_ not available on certain targets
 # (they need “ifunc”, indirect functions, a GNU extension).

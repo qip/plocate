@@ -15,5 +15,8 @@ extern int64_t limit_matches;
 extern int64_t limit_left;  // Not strictly an option.
 extern bool stdout_is_tty;  // Same.
 extern bool literal_printing;
+extern bool show_size;
+extern bool show_allocated;
+extern bool show_checksum;
 
 #endif  // !defined(_OPTIONS_H)

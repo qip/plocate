@@ -161,6 +161,26 @@ anything. This option thus exists only as compatibility with
 .BR mlocate (1).
 
 .TP
+\fB\-S\fR, \fB\-\-size\fR
+Append the file size in bytes (comma\-separated) after each matching path.
+Requires that the database was built with file\-size metadata
+(the default for
+.BR updatedb (8)).
+
+.TP
+\fB\-a\fR, \fB\-\-allocated\fR
+Append the allocated size in bytes (comma\-separated) after each matching path.
+Requires that the database was built with file\-size metadata.
+
+.TP
+\fB\-C\fR, \fB\-\-checksum\fR
+Append the hex\-encoded checksum (comma\-separated) after each matching path.
+Requires that the database was built with checksum data (see
+.B \-\-checksum\-command
+in
+.BR updatedb (8)).
+
+.TP
 .B \-\-help
 Print out usage information, then exit successfully.
 
@@ -169,31 +189,34 @@ Print out usage information, then exit successfully.
 Print out version information, then exit successfully.
 
 .SH OUTPUT FORMAT
-If the database was built with file\-size metadata (the default for
-.BR updatedb (8)),
-each matching path is printed as:
+By default, only matching paths are printed, one per line.
+The
+.BR \-S ,
+.BR \-a ,
+and
+.B \-C
+options append additional comma\-separated fields after each path.
+Fields always appear in the fixed order:
 .RS
-.I path\fB,\fIsize\fB,\fIallocated\fR
+.I path\fR[\fB,\fIsize\fR][\fB,\fIallocated\fR][\fB,\fIchecksum\fR]
 .RE
-where
-.I size
-is the file size in bytes and
-.I allocated
-is the allocated size in bytes.
-If a file has no size information, both values are shown as
-.BR \-1 .
+regardless of the order the options are given on the command line.
 .P
-If the database additionally contains checksums (see
-.B \-\-checksum\-command
-in
-.BR updatedb (8)),
-each matching path is printed as:
+For example,
+.B plocate \-S \-a \-C pattern
+prints:
 .RS
 .I path\fB,\fIsize\fB,\fIallocated\fB,\fIchecksum\fR
 .RE
-where
-.I checksum
-is a hex\-encoded string (empty if no checksum was computed for that file).
+while
+.B plocate \-S pattern
+prints:
+.RS
+.I path\fB,\fIsize\fR
+.RE
+.P
+If a requested field is not available in the database, an empty value is produced
+(e.g. \fIpath\fB,\fR for \fB\-S\fR with no file\-size data).
 
 .SH ENVIRONMENT
 

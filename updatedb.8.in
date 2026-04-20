@@ -168,6 +168,33 @@ Skip checksum computation for files smaller than \fIBYTES\fR (default 0).
 Files that are skipped will have an empty checksum in the database.
 
 .TP
+\fB\-\-checksum\-xattr\fR \fIATTR\fR
+Read the file checksum from extended attribute \fIATTR\fR
+(e.g.\& \fBuser.checksum.sha256\fR) instead of running
+\fB\-\-checksum\-command\fR.
+The attribute value is expected to be a hex\-encoded checksum,
+optionally followed by whitespace and additional text (only the first
+whitespace\-delimited token is used).
+When this option is set it takes precedence over
+\fB\-\-checksum\-command\fR for normal reads.
+
+.TP
+\fB\-\-checksum\-xattr\-mtime\fR \fIATTR\fR
+When \fB\-\-checksum\-xattr\fR is also set, read extended attribute
+\fIATTR\fR to obtain the modification time at which the checksum was
+last computed.
+The value may be either
+.IR sec . nsec
+(e.g.\& \fB1712345678.123456789\fR) or a semicolon\-separated key=value list
+containing an \fBmtime=\fIsec\fB.\fInsec\fR field.
+If the recorded mtime is older than the file\(cqs actual mtime
+(i.e.\& the file was modified after the checksum was stored),
+.B updatedb
+falls back to \fB\-\-checksum\-command\fR to recompute the checksum.
+If \fB\-\-checksum\-command\fR is not set, a warning is printed and the
+(potentially stale) xattr checksum is used anyway.
+
+.TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Output path names of files to standard output, as soon as they are found.
 

@@ -73,5 +73,7 @@ extern bool use_debug;
 
 extern std::string conf_checksum_command;
 extern int64_t conf_min_checksum_size;
+extern std::string conf_checksum_xattr;
+extern std::string conf_checksum_xattr_mtime;
 
 #endif

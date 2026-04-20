@@ -55,6 +55,7 @@ any later version.
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -813,6 +814,85 @@ static string compute_checksum(const string &command, const string &filepath)
 	return hex_to_bytes(hex_str);
 }
 
+static string read_xattr_string(const string &filepath, const string &attr_name)
+{
+	char buf[256];
+	ssize_t len = getxattr(filepath.c_str(), attr_name.c_str(), buf, sizeof(buf));
+	if (len < 0) {
+		if (errno == ERANGE) {
+			len = getxattr(filepath.c_str(), attr_name.c_str(), nullptr, 0);
+			if (len <= 0) return "";
+			string val(len, '\0');
+			len = getxattr(filepath.c_str(), attr_name.c_str(), val.data(), len);
+			if (len <= 0) return "";
+			val.resize(len);
+			return val;
+		}
+		return "";
+	}
+	return string(buf, len);
+}
+
+static string read_xattr_checksum(const string &filepath)
+{
+	string val = read_xattr_string(filepath, conf_checksum_xattr);
+	if (val.empty()) return "";
+
+	while (!val.empty() && (val.back() == '\n' || val.back() == '\r' || val.back() == ' '))
+		val.pop_back();
+	if (val.empty()) return "";
+
+	size_t pos = val.find_first_of(" \t");
+	string hex_str = (pos != string::npos) ? val.substr(0, pos) : val;
+	return hex_to_bytes(hex_str);
+}
+
+static struct timespec parse_xattr_mtime(const string &val)
+{
+	struct timespec ts = { 0, 0 };
+	const char *p = val.c_str();
+
+	const char *mtime_key = strstr(p, "mtime=");
+	if (mtime_key)
+		p = mtime_key + 6;
+
+	char *end;
+	ts.tv_sec = strtol(p, &end, 10);
+	if (*end == '.') {
+		const char *ns_start = end + 1;
+		ts.tv_nsec = strtol(ns_start, &end, 10);
+		int digits = end - ns_start;
+		for (int i = digits; i < 9; i++)
+			ts.tv_nsec *= 10;
+	}
+	return ts;
+}
+
+static string get_checksum_for_entry(const string &filepath,
+                                     const struct timespec &file_mtime)
+{
+	if (!conf_checksum_xattr.empty()) {
+		if (!conf_checksum_xattr_mtime.empty()) {
+			string mtime_val = read_xattr_string(filepath, conf_checksum_xattr_mtime);
+			if (!mtime_val.empty()) {
+				struct timespec xattr_ts = parse_xattr_mtime(mtime_val);
+				if (xattr_ts.tv_sec > file_mtime.tv_sec ||
+				    (xattr_ts.tv_sec == file_mtime.tv_sec &&
+				     xattr_ts.tv_nsec >= file_mtime.tv_nsec)) {
+					return read_xattr_checksum(filepath);
+				}
+			}
+			if (!conf_checksum_command.empty())
+				return compute_checksum(conf_checksum_command, filepath);
+			return read_xattr_checksum(filepath);
+		}
+		return read_xattr_checksum(filepath);
+	}
+	if (!conf_checksum_command.empty())
+		return compute_checksum(conf_checksum_command, filepath);
+	return "";
+}
+
 // Takes ownership of fd.
 int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_time db_modified, ExistingDB *existing_db, DatabaseReceiver *corpus, DictionaryBuilder *dict_builder)
 {
@@ -1057,7 +1137,7 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 	}
 
 	// Compute checksums where needed.
-	if (!conf_checksum_command.empty()) {
+	if (!conf_checksum_xattr.empty() || !conf_checksum_command.empty()) {
 		for (entry &e : entries) {
 			if (e.is_directory) continue;
 			if (e.filesize >= 0 && e.filesize < conf_min_checksum_size) {
@@ -1070,7 +1150,7 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 				  e.file_mtime.tv_nsec > db_file_mtime.tv_nsec));
 			if (needs_recompute) {
 				string filepath = path_plus_slash + e.name;
-				e.checksum = compute_checksum(conf_checksum_command, filepath);
+				e.checksum = get_checksum_for_entry(filepath, e.file_mtime);
 			}
 		}
 	}
