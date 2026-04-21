@@ -58,8 +58,8 @@ extern char *conf_scan_root;
 /* Absolute (not necessarily canonical) path to the database */
 extern std::string conf_output;
 
-/* true if file names should be written to stdout as they are found */
-extern bool conf_verbose;
+/* Verbosity level: 0=quiet, 1=print paths, 2=detailed processing info */
+extern int conf_verbose;
 
 /* Configuration representation for the database configuration block */
 extern std::string conf_block;

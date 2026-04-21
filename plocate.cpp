@@ -74,6 +74,11 @@ static uint32_t db_block_size = 0;
 static vector<string> checksum_array;
 static bool has_checksum_data = false;
 
+enum SizeMatchMode { SIZE_MATCH_NONE, SIZE_MATCH_GT, SIZE_MATCH_LT, SIZE_MATCH_EQ };
+static SizeMatchMode match_size_mode = SIZE_MATCH_NONE;
+static int64_t match_size_value = 0;
+static string match_checksum_bytes;
+
 class Corpus {
 public:
 	Corpus(int fd, const char *filename_for_errors, IOUringEngine *engine);
@@ -269,6 +274,26 @@ static string bytes_to_hex(const string &bytes)
 	return hex;
 }
 
+static string hex_to_bytes(const char *hex)
+{
+	string bytes;
+	size_t len = strlen(hex);
+	if (len % 2 != 0) {
+		fprintf(stderr, "plocate: checksum hex string must have even length\n");
+		exit(1);
+	}
+	bytes.reserve(len / 2);
+	for (size_t i = 0; i < len; i += 2) {
+		unsigned int val;
+		if (sscanf(hex + i, "%2x", &val) != 1) {
+			fprintf(stderr, "plocate: invalid hex character in checksum at position %zu\n", i);
+			exit(1);
+		}
+		bytes.push_back(static_cast<char>(val));
+	}
+	return bytes;
+}
+
 static string format_with_metadata(const char *filename, uint32_t docid, uint32_t local_file_idx)
 {
 	if (!show_size && !show_allocated && !show_checksum)
@@ -298,6 +323,35 @@ static string format_with_metadata(const char *filename, uint32_t docid, uint32_
 	}
 
 	return result;
+}
+
+static bool matches_metadata_filters(uint32_t docid, uint32_t local_file_idx)
+{
+	if (match_size_mode == SIZE_MATCH_NONE && match_checksum_bytes.empty())
+		return true;
+
+	size_t global_idx = (size_t)docid * db_block_size + local_file_idx;
+
+	if (match_size_mode != SIZE_MATCH_NONE) {
+		if (filesize_array == nullptr || db_block_size == 0 || global_idx >= filesize_total_files)
+			return false;
+		int64_t size = filesize_array[global_idx * 2];
+		switch (match_size_mode) {
+		case SIZE_MATCH_GT: if (size <= match_size_value) return false; break;
+		case SIZE_MATCH_LT: if (size >= match_size_value) return false; break;
+		case SIZE_MATCH_EQ: if (size != match_size_value) return false; break;
+		default: break;
+		}
+	}
+
+	if (!match_checksum_bytes.empty()) {
+		if (!has_checksum_data || global_idx >= checksum_array.size() || checksum_array[global_idx].empty())
+			return false;
+		if (checksum_array[global_idx] != match_checksum_bytes)
+			return false;
+	}
+
+	return true;
 }
 
 void scan_file_block(const vector<Needle> &needles, string_view compressed,
@@ -367,6 +421,9 @@ void scan_file_block(const vector<Needle> &needles, string_view compressed,
 				found = false;
 				break;
 			}
+		}
+		if (found) {
+			found = matches_metadata_filters(docid, local_file_idx);
 		}
 		if (found) {
 			if (pending_candidate != nullptr) {
@@ -620,9 +677,9 @@ uint64_t do_search_file(const vector<Needle> &needles, const std::string &filena
 
 	IOUringEngine engine(/*slop_bytes=*/16);  // 16 slop bytes as described in turbopfor.h.
 	Corpus corpus(fd, filename.c_str(), &engine);
-	if (show_size || show_allocated)
+	if (show_size || show_allocated || match_size_mode != SIZE_MATCH_NONE)
 		load_filesize_data(fd, corpus.get_hdr());
-	if (show_checksum)
+	if (show_checksum || !match_checksum_bytes.empty())
 		load_checksum_data(fd, corpus.get_hdr());
 	dprintf("Corpus init done after %.1f ms.\n", 1e3 * duration<float>(steady_clock::now() - start).count());
 
@@ -951,6 +1008,8 @@ void usage()
 		"  -S, --size             print file size (bytes) after each match\n"
 		"  -a, --allocated        print allocated size (bytes) after each match\n"
 		"  -C, --checksum         print checksum (hex) after each match\n"
+		"      --match-size [+|-]N  filter by size: +N greater, -N less, N equal\n"
+		"      --match-checksum HEX filter by exact checksum (hex)\n"
 		"      --help             print this help\n"
 		"      --version          print version information\n");
 }
@@ -971,6 +1030,8 @@ int main(int argc, char **argv)
 
 	constexpr int EXTENDED_REGEX = 1000;
 	constexpr int FLUSH_CACHE = 1001;
+	constexpr int MATCH_SIZE = 1002;
+	constexpr int MATCH_CHECKSUM = 1003;
 	static const struct option long_options[] = {
 		{ "help", no_argument, 0, 'h' },
 		{ "count", no_argument, 0, 'c' },
@@ -989,6 +1050,8 @@ int main(int argc, char **argv)
 		{ "size", no_argument, 0, 'S' },
 		{ "allocated", no_argument, 0, 'a' },
 		{ "checksum", no_argument, 0, 'C' },
+		{ "match-size", required_argument, 0, MATCH_SIZE },
+		{ "match-checksum", required_argument, 0, MATCH_CHECKSUM },
 		{ "debug", no_argument, 0, 'D' },  // Not documented.
 		// Enable to test cold-cache behavior (except for access()). Not documented.
 		{ "flush-cache", no_argument, 0, FLUSH_CACHE },
@@ -1056,6 +1119,28 @@ int main(int argc, char **argv)
 			break;
 		case 'C':
 			show_checksum = true;
+			break;
+		case MATCH_SIZE: {
+			const char *arg = optarg;
+			if (arg[0] == '+') {
+				match_size_mode = SIZE_MATCH_GT;
+				arg++;
+			} else if (arg[0] == '-') {
+				match_size_mode = SIZE_MATCH_LT;
+				arg++;
+			} else {
+				match_size_mode = SIZE_MATCH_EQ;
+			}
+			char *endptr;
+			match_size_value = strtoll(arg, &endptr, 10);
+			if (*endptr != '\0' || endptr == arg) {
+				fprintf(stderr, "plocate: invalid size value '%s'\n", optarg);
+				exit(1);
+			}
+			break;
+		}
+		case MATCH_CHECKSUM:
+			match_checksum_bytes = hex_to_bytes(optarg);
 			break;
 		case 'D':
 			use_debug = true;

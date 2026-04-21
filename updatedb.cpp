@@ -987,12 +987,30 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 		// by reading from the database. (We still need to open and stat everything,
 		// though, but that happens in a later step.)
 		entries = move(db_entries);
+		if (conf_verbose >= 2) {
+			if (!conf_include_paths.empty() && !path_is_included(path)) {
+				fprintf(stderr, "reuse %s (pass-through)\n", path.c_str());
+			} else {
+				fprintf(stderr, "reuse %s (%zu entries, dir unchanged)\n", path.c_str(), entries.size());
+			}
+		}
 		if (conf_verbose) {
 			for (const entry &e : entries) {
-				printf("%s/%s\n", path.c_str(), e.name.c_str());
+				string entry_path = path_plus_slash + e.name;
+				if (path_is_excluded(entry_path)) continue;
+				if (!path_is_included(entry_path) &&
+				    !(e.is_directory && path_leads_to_included(entry_path))) continue;
+				printf("%s\n", entry_path.c_str());
 			}
 		}
 	} else {
+		if (conf_verbose >= 2) {
+			if (!conf_include_paths.empty() && !path_is_included(path)) {
+				fprintf(stderr, "scan  %s (pass-through)\n", path.c_str());
+			} else {
+				fprintf(stderr, "scan  %s\n", path.c_str());
+			}
+		}
 		dir = fdopendir(fd);  // Takes over ownership of fd.
 		if (dir == nullptr) {
 			// fdopendir() wants to fstat() the fd to verify that it's indeed
@@ -1039,7 +1057,12 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 			}
 
 			if (conf_verbose) {
-				printf("%s/%s\n", path.c_str(), de->d_name);
+				string entry_path = path_plus_slash + e.name;
+				if (!path_is_excluded(entry_path) &&
+				    (path_is_included(entry_path) ||
+				     (e.is_directory && path_leads_to_included(entry_path)))) {
+					printf("%s\n", entry_path.c_str());
+				}
 			}
 			entries.push_back(move(e));
 		}
@@ -1140,7 +1163,12 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 	if (!conf_checksum_xattr.empty() || !conf_checksum_command.empty()) {
 		for (entry &e : entries) {
 			if (e.is_directory) continue;
+			string filepath = path_plus_slash + e.name;
+			if (path_is_excluded(filepath) || !path_is_included(filepath)) continue;
 			if (e.filesize >= 0 && e.filesize < conf_min_checksum_size) {
+				if (conf_verbose >= 2) {
+					fprintf(stderr, "  checksum skip (size < min): %s\n", filepath.c_str());
+				}
 				e.checksum.clear();
 				continue;
 			}
@@ -1149,8 +1177,17 @@ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_ti
 				 (e.file_mtime.tv_sec == db_file_mtime.tv_sec &&
 				  e.file_mtime.tv_nsec > db_file_mtime.tv_nsec));
 			if (needs_recompute) {
-				string filepath = path_plus_slash + e.name;
+				bool was_empty = e.checksum.empty();
 				e.checksum = get_checksum_for_entry(filepath, e.file_mtime);
+				if (conf_verbose >= 2) {
+					if (was_empty) {
+						fprintf(stderr, "  checksum computed (new): %s\n", filepath.c_str());
+					} else {
+						fprintf(stderr, "  checksum updated (file modified): %s\n", filepath.c_str());
+					}
+				}
+			} else if (conf_verbose >= 2) {
+				fprintf(stderr, "  checksum kept: %s\n", filepath.c_str());
 			}
 		}
 	}
@@ -1218,6 +1255,14 @@ int main(int argc, char **argv)
 	}
 	ExistingDB existing_db(fd);
 
+	if (conf_verbose) {
+		if (existing_db.get_error()) {
+			fprintf(stderr, "No usable existing database; building from scratch.\n");
+		} else {
+			fprintf(stderr, "Incremental update from existing database.\n");
+		}
+	}
+
 	DictionaryBuilder dict_builder(/*blocks_to_keep=*/1000, conf_block_size);
 
 	gid_t owner = -1;
@@ -1256,6 +1301,10 @@ int main(int argc, char **argv)
 	string next_dictionary = dict_builder.train(1024);
 	db.set_next_dictionary(next_dictionary);
 	db.finish_corpus();
+
+	if (conf_verbose) {
+		fprintf(stderr, "Database written to %s\n", conf_output.c_str());
+	}
 
 	exit(EXIT_SUCCESS);
 }

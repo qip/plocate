@@ -181,6 +181,31 @@ in
 .BR updatedb (8)).
 
 .TP
+\fB\-\-match\-size\fR [\fB+\fR|\fB\-\fR]\fIN\fR
+Filter results by file size in bytes.
+A leading \fB+\fR selects files strictly larger than \fIN\fR,
+a leading \fB\-\fR selects files strictly smaller than \fIN\fR,
+and a bare number selects files of exactly \fIN\fR bytes.
+Requires that the database was built with file\-size metadata.
+Files without size metadata are excluded.
+Can be combined with \fB\-\-match\-checksum\fR and path patterns
+(all conditions are ANDed).
+.IP
+Example: \fB\-\-match\-size +1048576\fR matches files larger than 1\ MiB.
+
+.TP
+\fB\-\-match\-checksum\fR \fIHEX\fR
+Filter results to only files whose stored checksum matches
+the given hex\-encoded value exactly.
+Requires that the database was built with checksum data (see
+.B \-\-checksum\-command
+in
+.BR updatedb (8)).
+Files without a checksum are excluded.
+Can be combined with \fB\-\-match\-size\fR and path patterns
+(all conditions are ANDed).
+
+.TP
 .B \-\-help
 Print out usage information, then exit successfully.
 

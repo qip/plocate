@@ -68,8 +68,8 @@ char *conf_scan_root; /* = NULL; */
 /* Absolute (not necessarily canonical) path to the database */
 string conf_output;
 
-/* 1 if file names should be written to stdout as they are found */
-bool conf_verbose; /* = false; */
+/* Verbosity level: 0=quiet, 1=print paths, 2+=detailed processing info */
+int conf_verbose = 0;
 
 /* Configuration representation for the database configuration block */
 string conf_block;
@@ -365,6 +365,7 @@ help(void)
 	         "                                 (default \"yes\")\n"
 	         "  -v, --verbose                  print paths of files as they "
 	         "are found\n"
+	         "                                 (repeat for more detail, e.g. -vv)\n"
 	         "  -V, --version                  print version information\n"
 	         "      --checksum-command CMD     compute file checksums using CMD\n"
 	         "                                 (e.g. sha256sum); if not set,\n"
@@ -592,7 +593,7 @@ parse_arguments(int argc, char *argv[])
 			break;
 
 		case 'v':
-			conf_verbose = true;
+			conf_verbose++;
 			break;
 
 		case 'b':
